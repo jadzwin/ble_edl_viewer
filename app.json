@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "ECUMaster BT RX Stats",
+    "slug": "ecumaster-ble-rx-stats",
+    "version": "1.5.0",
+    "newArchEnabled": false,
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.ecumaster.blerxstats",
+      "userInterfaceStyle": "light",
+      "versionCode": 6,
+      "permissions": [
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN"
+      ]
+    },
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "neverForLocation": false
+        }
+      ]
+    ],
+    "orientation": "default"
+  }
+}
