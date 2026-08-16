@@ -84,6 +84,9 @@ export const READABLE_CHANNELS: Readonly<Partial<Record<number, ChannelDefinitio
   99: { id: 99, name: "Round trip time", divider: 128, unit: "ms", min: 1.0, max: 200.0, decimalPoint: 2, groupName: "Statistic" },
   100: { id: 100, name: "BLE signal strength", divider: 1, unit: "dBm", min: -110, max: 0, decimalPoint: 0, groupName: "Statistic" },
   250: { id: 250, name: "EDL FW ver.", divider: 100, unit: "", min: 1.0, max: 200.0, decimalPoint: 2, groupName: "Other" },
+  252: { id: 252, name: "BT Rotary 5-8", divider: 1, unit: "RAW", min: 0, max: 65535, decimalPoint: 0, groupName: "Bluetooth controls" },
+  253: { id: 253, name: "BT Rotary 1-4", divider: 1, unit: "RAW", min: 0, max: 65535, decimalPoint: 0, groupName: "Bluetooth controls" },
+  254: { id: 254, name: "BT Switches", divider: 1, unit: "RAW", min: 0, max: 255, decimalPoint: 0, groupName: "Bluetooth controls" },
   255: { id: 255, name: "Check engine code", divider: 1, unit: "", min: 0, max: 65535, decimalPoint: 0, groupName: "Engine" },
 } as const;
 

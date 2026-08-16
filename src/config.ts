@@ -9,6 +9,7 @@ export const BLE_CONFIG = {
   targetDeviceId: '98:DA:20:07:E0:AC',
   preferredServiceUuid: '0000ffe0-0000-1000-8000-00805f9b34fb',
   preferredNotifyCharacteristicUuid: '0000ffe1-0000-1000-8000-00805f9b34fb',
+  preferredWriteCharacteristicUuid: '0000ffe2-0000-1000-8000-00805f9b34fb',
   requestedMtu: 247,
   scanTimeoutMs: 20_000,
   connectionTimeoutMs: 15_000,

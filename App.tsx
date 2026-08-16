@@ -14,7 +14,7 @@ import {
   useWindowDimensions,
   View,
 } from 'react-native';
-import { toByteArray } from 'base64-js';
+import { fromByteArray, toByteArray } from 'base64-js';
 import {
   BleError,
   BleManager,
@@ -31,14 +31,22 @@ import type {
   BleStatsSnapshot,
   ChannelLiveSnapshot,
   ChannelStatsSnapshot,
+  ParsedChannelFrame,
   DistributionSnapshot,
 } from './src/BleStatsCollector';
 import { BLE_CONFIG } from './src/config';
 import { READABLE_CHANNEL_LIST, READABLE_CHANNELS, formatChannelValue } from './src/channels';
 import { monotonicNowMs } from './src/time';
+import {
+  CONTROL_CHANNEL_IDS,
+  ControlStateSynchronizer,
+  buildLatencyReplyFrame,
+  frameToHex,
+} from './src/controlProtocol';
+import type { ControlSyncSnapshot } from './src/controlProtocol';
 
 type TransportMode = 'ble' | 'spp';
-type MainView = 'connection' | 'channels' | 'statistics';
+type MainView = 'connection' | 'channels' | 'controls' | 'statistics';
 type ClassicDeviceType = 'CLASSIC' | 'LOW_ENERGY' | 'DUAL' | 'UNKNOWN';
 type ClassicRxEncoding = 'unknown' | 'base64' | 'binary-string';
 
@@ -89,6 +97,7 @@ interface ClassicDeviceLike {
   connect(options?: Record<string, unknown>): Promise<boolean>;
   isConnected(): Promise<boolean>;
   disconnect(): Promise<boolean>;
+  write(data: string, encoding?: string): Promise<boolean>;
   onDataReceived(listener: (event: ClassicReadEventLike) => void): RemovableSubscription;
 }
 
@@ -116,6 +125,9 @@ interface BleConnectedInfo {
   mtu: number;
   serviceUuid: string;
   notifyCharacteristicUuid: string;
+  writeServiceUuid: string | null;
+  writeCharacteristicUuid: string | null;
+  writeMode: 'without-response' | 'with-response' | 'unavailable';
   characteristicSummary: string;
   connectedAtIso: string;
 }
@@ -163,7 +175,109 @@ interface ChannelTileModel {
   unknown: boolean;
 }
 
+type TxFrameKind = 'latency-reply' | 'switch-status';
+type BleWriteMode = 'without-response' | 'with-response';
+
+interface BleTxTarget {
+  deviceId: string;
+  serviceUuid: string;
+  characteristicUuid: string;
+  mode: BleWriteMode;
+}
+
+interface TxQueueItem {
+  kind: TxFrameKind;
+  payload: Uint8Array;
+  enqueuedAtMs: number;
+  generation: number;
+}
+
+interface TxDiagnosticsSnapshot {
+  switchPolls: number;
+  switchFramesQueued: number;
+  switchFramesSent: number;
+  latencyRequests: number;
+  latencyRepliesQueued: number;
+  latencyRepliesSent: number;
+  txErrors: number;
+  queueDepth: number;
+  lastTxKind: TxFrameKind | null;
+  lastTxHex: string;
+  lastTxAgoMs: number | null;
+  lastWriteDurationMs: number | null;
+  lastQueueDelayMs: number | null;
+  lastError: string | null;
+}
+
+interface TxDiagnosticsMutable {
+  switchPolls: number;
+  switchFramesQueued: number;
+  switchFramesSent: number;
+  latencyRequests: number;
+  latencyRepliesQueued: number;
+  latencyRepliesSent: number;
+  txErrors: number;
+  lastTxKind: TxFrameKind | null;
+  lastTxHex: string;
+  lastTxAtMs: number | null;
+  lastWriteDurationMs: number | null;
+  lastQueueDelayMs: number | null;
+  lastError: string | null;
+}
+
 const SPP_READ_SIZE = 8192;
+
+function emptyTxDiagnosticsMutable(): TxDiagnosticsMutable {
+  return {
+    switchPolls: 0,
+    switchFramesQueued: 0,
+    switchFramesSent: 0,
+    latencyRequests: 0,
+    latencyRepliesQueued: 0,
+    latencyRepliesSent: 0,
+    txErrors: 0,
+    lastTxKind: null,
+    lastTxHex: '',
+    lastTxAtMs: null,
+    lastWriteDurationMs: null,
+    lastQueueDelayMs: null,
+    lastError: null,
+  };
+}
+
+function txDiagnosticsSnapshot(
+  value: TxDiagnosticsMutable,
+  nowMs: number,
+  queueDepth: number,
+): TxDiagnosticsSnapshot {
+  return {
+    switchPolls: value.switchPolls,
+    switchFramesQueued: value.switchFramesQueued,
+    switchFramesSent: value.switchFramesSent,
+    latencyRequests: value.latencyRequests,
+    latencyRepliesQueued: value.latencyRepliesQueued,
+    latencyRepliesSent: value.latencyRepliesSent,
+    txErrors: value.txErrors,
+    queueDepth,
+    lastTxKind: value.lastTxKind,
+    lastTxHex: value.lastTxHex,
+    lastTxAgoMs:
+      value.lastTxAtMs === null ? null : Math.max(0, nowMs - value.lastTxAtMs),
+    lastWriteDurationMs: value.lastWriteDurationMs,
+    lastQueueDelayMs: value.lastQueueDelayMs,
+    lastError: value.lastError,
+  };
+}
+
+function writableMode(characteristic: Characteristic): BleWriteMode | null {
+  if (characteristic.isWritableWithoutResponse) {
+    return 'without-response';
+  }
+  if (characteristic.isWritableWithResponse) {
+    return 'with-response';
+  }
+  return null;
+}
 
 function normalizedUuid(uuid: string): string {
   return uuid.trim().toLowerCase();
@@ -570,6 +684,14 @@ export default function App() {
   const classicRxEncodingRef = useRef<ClassicRxEncoding>('unknown');
   const mainViewRef = useRef<MainView>('connection');
 
+  const controlSynchronizerRef = useRef(new ControlStateSynchronizer());
+  const bleTxTargetRef = useRef<BleTxTarget | null>(null);
+  const highPriorityTxQueueRef = useRef<TxQueueItem[]>([]);
+  const normalPriorityTxQueueRef = useRef<TxQueueItem[]>([]);
+  const txProcessingRef = useRef(false);
+  const txGenerationRef = useRef(0);
+  const txDiagnosticsRef = useRef<TxDiagnosticsMutable>(emptyTxDiagnosticsMutable());
+
   const [transportMode, setTransportMode] = useState<TransportMode>('ble');
   const [mainView, setMainView] = useState<MainView>('connection');
   const [connectionState, setConnectionState] = useState<ConnectionState>('idle');
@@ -584,6 +706,12 @@ export default function App() {
   const [liveChannels, setLiveChannels] = useState<ChannelLiveSnapshot[]>([]);
   const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
   const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
+  const [controlState, setControlState] = useState<ControlSyncSnapshot>(() =>
+    controlSynchronizerRef.current.snapshot(),
+  );
+  const [txDiagnostics, setTxDiagnostics] = useState<TxDiagnosticsSnapshot>(() =>
+    txDiagnosticsSnapshot(emptyTxDiagnosticsMutable(), monotonicNowMs(), 0),
+  );
 
   const selectMainView = useCallback((nextView: MainView) => {
     mainViewRef.current = nextView;
@@ -698,6 +826,193 @@ export default function App() {
     setLiveChannels([]);
   }, []);
 
+  const resetControlSession = useCallback(() => {
+    txGenerationRef.current += 1;
+    highPriorityTxQueueRef.current.length = 0;
+    normalPriorityTxQueueRef.current.length = 0;
+    bleTxTargetRef.current = null;
+    const controlSnapshot = controlSynchronizerRef.current.reset();
+    const emptyTx = emptyTxDiagnosticsMutable();
+    txDiagnosticsRef.current = emptyTx;
+    setControlState(controlSnapshot);
+    setTxDiagnostics(txDiagnosticsSnapshot(emptyTx, monotonicNowMs(), 0));
+  }, []);
+
+  const writeTransportFrame = useCallback(
+    async (payload: Uint8Array): Promise<void> => {
+      const valueBase64 = fromByteArray(payload);
+      const transport = connectedTransportRef.current;
+
+      if (transport === 'ble') {
+        const target = bleTxTargetRef.current;
+        if (target === null) {
+          throw new Error('BLE: nie znaleziono zapisywalnej charakterystyki TX.');
+        }
+        if (target.mode === 'without-response') {
+          await manager.writeCharacteristicWithoutResponseForDevice(
+            target.deviceId,
+            target.serviceUuid,
+            target.characteristicUuid,
+            valueBase64,
+          );
+        } else {
+          await manager.writeCharacteristicWithResponseForDevice(
+            target.deviceId,
+            target.serviceUuid,
+            target.characteristicUuid,
+            valueBase64,
+          );
+        }
+        return;
+      }
+
+      if (transport === 'spp') {
+        const device = connectedSppDeviceRef.current;
+        if (device === null) {
+          throw new Error('SPP: brak aktywnego socketu RFCOMM.');
+        }
+        const written = await device.write(valueBase64, 'base64');
+        if (!written) {
+          throw new Error('SPP: write() zwróciło false.');
+        }
+        return;
+      }
+
+      throw new Error('Brak aktywnego transportu TX.');
+    },
+    [manager],
+  );
+
+  const processTxQueue = useCallback(async (): Promise<void> => {
+    if (txProcessingRef.current) {
+      return;
+    }
+
+    txProcessingRef.current = true;
+    try {
+      while (
+        highPriorityTxQueueRef.current.length > 0 ||
+        normalPriorityTxQueueRef.current.length > 0
+      ) {
+        const item =
+          highPriorityTxQueueRef.current.shift() ??
+          normalPriorityTxQueueRef.current.shift();
+        if (item === undefined || item.generation !== txGenerationRef.current) {
+          continue;
+        }
+
+        const writeStartedAt = monotonicNowMs();
+        const queueDelayMs = Math.max(0, writeStartedAt - item.enqueuedAtMs);
+        try {
+          await writeTransportFrame(item.payload);
+          if (item.generation !== txGenerationRef.current) {
+            continue;
+          }
+          const completedAt = monotonicNowMs();
+          const diagnostics = txDiagnosticsRef.current;
+          if (item.kind === 'latency-reply') {
+            diagnostics.latencyRepliesSent += 1;
+          } else {
+            diagnostics.switchFramesSent += 1;
+          }
+          diagnostics.lastTxKind = item.kind;
+          diagnostics.lastTxHex = frameToHex(item.payload);
+          diagnostics.lastTxAtMs = completedAt;
+          diagnostics.lastWriteDurationMs = Math.max(0, completedAt - writeStartedAt);
+          diagnostics.lastQueueDelayMs = queueDelayMs;
+          diagnostics.lastError = null;
+        } catch (error) {
+          if (item.generation !== txGenerationRef.current) {
+            continue;
+          }
+          const diagnostics = txDiagnosticsRef.current;
+          diagnostics.txErrors += 1;
+          diagnostics.lastError = errorDescription(error);
+          diagnostics.lastTxKind = item.kind;
+          diagnostics.lastTxHex = frameToHex(item.payload);
+          diagnostics.lastTxAtMs = monotonicNowMs();
+          diagnostics.lastWriteDurationMs = Math.max(
+            0,
+            monotonicNowMs() - writeStartedAt,
+          );
+          diagnostics.lastQueueDelayMs = queueDelayMs;
+        }
+      }
+    } finally {
+      txProcessingRef.current = false;
+    }
+  }, [writeTransportFrame]);
+
+  const enqueueTxFrame = useCallback(
+    (kind: TxFrameKind, payload: Uint8Array, highPriority: boolean): void => {
+      const item: TxQueueItem = {
+        kind,
+        payload: payload.slice(),
+        enqueuedAtMs: monotonicNowMs(),
+        generation: txGenerationRef.current,
+      };
+      if (highPriority) {
+        highPriorityTxQueueRef.current.push(item);
+      } else {
+        normalPriorityTxQueueRef.current.push(item);
+      }
+
+      const diagnostics = txDiagnosticsRef.current;
+      if (kind === 'latency-reply') {
+        diagnostics.latencyRepliesQueued += 1;
+      } else {
+        diagnostics.switchFramesQueued += 1;
+      }
+      void processTxQueue();
+    },
+    [processTxQueue],
+  );
+
+  const handleParsedFrames = useCallback(
+    (frames: readonly ParsedChannelFrame[]): void => {
+      // RTT ma najwyższy priorytet. Najpierw przeglądamy cały odebrany fragment
+      // pod kątem ID 99, a dopiero później kolejkujemy ramki statusu switchy.
+      for (const frame of frames) {
+        if (frame.id === CONTROL_CHANNEL_IDS.roundTrip) {
+          txDiagnosticsRef.current.latencyRequests += 1;
+          enqueueTxFrame('latency-reply', buildLatencyReplyFrame(), true);
+        }
+      }
+
+      let stateChanged = false;
+      for (const frame of frames) {
+        const result = controlSynchronizerRef.current.ingestChannel(frame.id, frame.raw);
+        stateChanged = stateChanged || result.stateChanged;
+        if (result.shouldSendSwitchFrame) {
+          txDiagnosticsRef.current.switchPolls += 1;
+          enqueueTxFrame(
+            'switch-status',
+            controlSynchronizerRef.current.buildSwitchFrame(),
+            false,
+          );
+        }
+      }
+
+      if (stateChanged) {
+        setControlState(controlSynchronizerRef.current.snapshot());
+      }
+    },
+    [enqueueTxFrame],
+  );
+
+  const toggleControlSwitch = useCallback((index: number) => {
+    setControlState(controlSynchronizerRef.current.toggleSwitch(index));
+  }, []);
+
+  const incrementControlRotary = useCallback((index: number) => {
+    setControlState(controlSynchronizerRef.current.incrementRotary(index));
+  }, []);
+
+  const resynchronizeControls = useCallback(() => {
+    setControlState(controlSynchronizerRef.current.reset());
+    normalPriorityTxQueueRef.current.length = 0;
+  }, []);
+
   const installBleMonitor = useCallback(
     async (device: Device, scanRssi: number | null): Promise<void> => {
       setConnectionState('discovering');
@@ -707,40 +1022,45 @@ export default function App() {
       const services = await preparedDevice.services();
       const preferredService = normalizedUuid(BLE_CONFIG.preferredServiceUuid);
       const preferredNotify = normalizedUuid(BLE_CONFIG.preferredNotifyCharacteristicUuid);
+      const preferredWrite = normalizedUuid(BLE_CONFIG.preferredWriteCharacteristicUuid);
       const orderedServices = [...services].sort((a, b) => {
         const aPreferred = normalizedUuid(a.uuid) === preferredService ? 0 : 1;
         const bPreferred = normalizedUuid(b.uuid) === preferredService ? 0 : 1;
         return aPreferred - bPreferred;
       });
 
-      let notifyCharacteristic: Characteristic | null = null;
+      const allCharacteristics: Characteristic[] = [];
       const characteristicDescriptions: string[] = [];
-
       for (const service of orderedServices) {
         const characteristics = await preparedDevice.characteristicsForService(service.uuid);
+        allCharacteristics.push(...characteristics);
         for (const characteristic of characteristics) {
           characteristicDescriptions.push(
             `${service.uuid}/${characteristic.uuid} ` +
               `[N=${characteristic.isNotifiable ? 1 : 0}, I=${
                 characteristic.isIndicatable ? 1 : 0
-              }, W=${characteristic.isWritableWithoutResponse ? 1 : 0}]`,
+              }, WNR=${characteristic.isWritableWithoutResponse ? 1 : 0}, WR=${
+                characteristic.isWritableWithResponse ? 1 : 0
+              }]`,
           );
         }
+      }
 
-        const preferred = characteristics.find(
+      const notifyCharacteristic =
+        allCharacteristics.find(
           (characteristic) =>
             normalizedUuid(characteristic.uuid) === preferredNotify &&
             (characteristic.isNotifiable || characteristic.isIndicatable),
-        );
-        const fallback = characteristics.find(
+        ) ??
+        allCharacteristics.find(
+          (characteristic) =>
+            normalizedUuid(characteristic.serviceUUID) === preferredService &&
+            (characteristic.isNotifiable || characteristic.isIndicatable),
+        ) ??
+        allCharacteristics.find(
           (characteristic) => characteristic.isNotifiable || characteristic.isIndicatable,
-        );
-
-        if (preferred !== undefined || fallback !== undefined) {
-          notifyCharacteristic = preferred ?? fallback ?? null;
-          break;
-        }
-      }
+        ) ??
+        null;
 
       if (notifyCharacteristic === null) {
         throw new Error(
@@ -750,9 +1070,37 @@ export default function App() {
         );
       }
 
+      const writeCharacteristic =
+        allCharacteristics.find(
+          (characteristic) =>
+            normalizedUuid(characteristic.uuid) === preferredWrite &&
+            writableMode(characteristic) !== null,
+        ) ??
+        allCharacteristics.find(
+          (characteristic) =>
+            normalizedUuid(characteristic.serviceUUID) ===
+              normalizedUuid(notifyCharacteristic.serviceUUID) &&
+            writableMode(characteristic) !== null,
+        ) ??
+        allCharacteristics.find((characteristic) => writableMode(characteristic) !== null) ??
+        null;
+      const writeMode =
+        writeCharacteristic === null ? null : writableMode(writeCharacteristic);
+
       setConnectionState('subscribing');
       setStatusText(`Subskrypcja ${notifyCharacteristic.serviceUUID}/${notifyCharacteristic.uuid}…`);
       resetStats();
+      resetControlSession();
+
+      if (writeCharacteristic !== null && writeMode !== null) {
+        bleTxTargetRef.current = {
+          deviceId: preparedDevice.id,
+          serviceUuid: writeCharacteristic.serviceUUID,
+          characteristicUuid: writeCharacteristic.uuid,
+          mode: writeMode,
+        };
+      }
+      connectedTransportRef.current = 'ble';
 
       setConnectedInfo({
         transport: 'ble',
@@ -762,6 +1110,9 @@ export default function App() {
         mtu: preparedDevice.mtu,
         serviceUuid: notifyCharacteristic.serviceUUID,
         notifyCharacteristicUuid: notifyCharacteristic.uuid,
+        writeServiceUuid: writeCharacteristic?.serviceUUID ?? null,
+        writeCharacteristicUuid: writeCharacteristic?.uuid ?? null,
+        writeMode: writeMode ?? 'unavailable',
         characteristicSummary: characteristicDescriptions.join('\n'),
         connectedAtIso: new Date().toISOString(),
       });
@@ -786,7 +1137,11 @@ export default function App() {
             }
 
             const payload = toByteArray(base64Value);
-            collectorRef.current.ingestNotification(payload, callbackStartedAt);
+            const parsedFrames = collectorRef.current.ingestNotification(
+              payload,
+              callbackStartedAt,
+            );
+            handleParsedFrames(parsedFrames);
           } catch {
             transportDecodeErrorsRef.current += 1;
           } finally {
@@ -801,6 +1156,10 @@ export default function App() {
         (error) => {
           connectedBleDeviceIdRef.current = null;
           connectedTransportRef.current = null;
+          bleTxTargetRef.current = null;
+          txGenerationRef.current += 1;
+          highPriorityTxQueueRef.current.length = 0;
+          normalPriorityTxQueueRef.current.length = 0;
           connectingRef.current = false;
           bleMonitorSubscriptionRef.current?.remove();
           bleMonitorSubscriptionRef.current = null;
@@ -817,13 +1176,16 @@ export default function App() {
         },
       );
 
-      connectedTransportRef.current = 'ble';
       connectingRef.current = false;
       setConnectionState('receiving');
       selectMainView('channels');
-      setStatusText('BLE: odbieranie notyfikacji. Brak logowania per ramka i brak operacji TX.');
+      setStatusText(
+        writeMode === null
+          ? 'BLE: odbieranie notyfikacji. Nie znaleziono charakterystyki TX — sterowanie i RTT będą niedostępne.'
+          : `BLE: RX aktywny; TX ${writeCharacteristic?.serviceUUID}/${writeCharacteristic?.uuid} (${writeMode}).`,
+      );
     },
-    [manager, resetStats, selectMainView],
+    [handleParsedFrames, manager, resetControlSession, resetStats, selectMainView],
   );
 
   const connectBleDevice = useCallback(
@@ -877,6 +1239,7 @@ export default function App() {
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
+    resetControlSession();
     // BLE nie powinno wywoływać żadnej funkcji z modułu Bluetooth Classic.
     // W v1.3 stopAllScans() wykonywało cancelDiscovery() Classic jeszcze przed
     // uzyskaniem BLUETOOTH_SCAN, co mogło powodować natywny crash na Android 12+.
@@ -925,7 +1288,7 @@ export default function App() {
       setConnectionState('error');
       setErrorText(errorDescription(error));
     }
-  }, [finishBleScan, manager, refreshBleScanList, removeSubscriptions, stopBleScan]);
+  }, [finishBleScan, manager, refreshBleScanList, removeSubscriptions, resetControlSession, stopBleScan]);
 
   const startSppScan = useCallback(async () => {
     if (connectingRef.current || connectedTransportRef.current !== null) {
@@ -936,6 +1299,7 @@ export default function App() {
     setErrorText(null);
     setConnectedInfo(null);
     removeSubscriptions();
+    resetControlSession();
     stopBleScan();
     discoveredSppObjectsRef.current.clear();
     discoveredSppRowsRef.current.clear();
@@ -969,7 +1333,7 @@ export default function App() {
       setConnectionState('error');
       setErrorText(errorDescription(error));
     }
-  }, [mergeSppDevices, removeSubscriptions, stopBleScan]);
+  }, [mergeSppDevices, removeSubscriptions, resetControlSession, stopBleScan]);
 
   const connectSelectedBleDevice = useCallback(
     async (deviceId: string) => {
@@ -997,17 +1361,19 @@ export default function App() {
         }
         connectedBleDeviceIdRef.current = null;
         connectedTransportRef.current = null;
+        resetControlSession();
         connectingRef.current = false;
         setConnectionState('error');
         setErrorText(errorDescription(connectError));
       }
     },
-    [connectBleDevice, manager, stopAllScans],
+    [connectBleDevice, manager, resetControlSession, stopAllScans],
   );
 
   const installSppReceiver = useCallback(
     (device: ClassicDeviceLike, row: SppScanDeviceRow, secureSocket: boolean): void => {
       resetStats();
+      resetControlSession();
       const address = classicAddress(device);
       connectedSppDeviceRef.current = device;
       connectedTransportRef.current = 'spp';
@@ -1036,7 +1402,11 @@ export default function App() {
             classicRxEncodingRef.current = decoded.encoding;
           }
           if (decoded.payload.length > 0) {
-            collectorRef.current.ingestNotification(decoded.payload, callbackStartedAt);
+            const parsedFrames = collectorRef.current.ingestNotification(
+              decoded.payload,
+              callbackStartedAt,
+            );
+            handleParsedFrames(parsedFrames);
           }
         } catch {
           transportDecodeErrorsRef.current += 1;
@@ -1055,6 +1425,9 @@ export default function App() {
         }
         connectedSppDeviceRef.current = null;
         connectedTransportRef.current = null;
+        txGenerationRef.current += 1;
+        highPriorityTxQueueRef.current.length = 0;
+        normalPriorityTxQueueRef.current.length = 0;
         connectingRef.current = false;
         classicDataSubscriptionRef.current?.remove();
         classicDataSubscriptionRef.current = null;
@@ -1089,7 +1462,7 @@ export default function App() {
         }.`,
       );
     },
-    [resetStats, selectMainView],
+    [handleParsedFrames, resetControlSession, resetStats, selectMainView],
   );
 
   const connectSelectedSppDevice = useCallback(
@@ -1175,18 +1548,20 @@ export default function App() {
         }
         connectedSppDeviceRef.current = null;
         connectedTransportRef.current = null;
+        resetControlSession();
         connectingRef.current = false;
         setConnectionState('error');
         setErrorText(errorDescription(error));
       }
     },
-    [cancelSppDiscovery, installSppReceiver, mergeSppDevices, stopBleScan],
+    [cancelSppDiscovery, installSppReceiver, mergeSppDevices, resetControlSession, stopBleScan],
   );
 
   const disconnect = useCallback(async () => {
     intentionalDisconnectRef.current = true;
     stopAllScans();
     removeSubscriptions();
+    resetControlSession();
     const currentTransport = connectedTransportRef.current;
     connectedTransportRef.current = null;
     connectingRef.current = false;
@@ -1217,7 +1592,7 @@ export default function App() {
     setConnectionState('disconnected');
     selectMainView('connection');
     setStatusText('Rozłączono ręcznie. Możesz ponownie uruchomić skan.');
-  }, [manager, removeSubscriptions, selectMainView, stopAllScans]);
+  }, [manager, removeSubscriptions, resetControlSession, selectMainView, stopAllScans]);
 
   const changeTransport = useCallback(
     (nextTransport: TransportMode) => {
@@ -1233,6 +1608,7 @@ export default function App() {
         void cancelSppDiscovery(true);
       }
       removeSubscriptions();
+      resetControlSession();
       connectingRef.current = false;
       setTransportMode(nextTransport);
       selectMainView('connection');
@@ -1249,6 +1625,7 @@ export default function App() {
     [
       cancelSppDiscovery,
       removeSubscriptions,
+      resetControlSession,
       resetStats,
       selectMainView,
       stopBleScan,
@@ -1283,6 +1660,9 @@ export default function App() {
         `mtu=${connectedInfo.mtu}`,
         `service=${connectedInfo.serviceUuid}`,
         `notify=${connectedInfo.notifyCharacteristicUuid}`,
+        `write_service=${connectedInfo.writeServiceUuid ?? '—'}`,
+        `write=${connectedInfo.writeCharacteristicUuid ?? '—'}`,
+        `write_mode=${connectedInfo.writeMode}`,
       );
     } else if (connectedInfo?.transport === 'spp') {
       infoLines.push(
@@ -1325,7 +1705,7 @@ export default function App() {
       });
 
     const report = [
-      'ECUMaster BT RX Stats v1.5',
+      'ECUMaster BT RX Stats v1.6',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
@@ -1361,6 +1741,26 @@ export default function App() {
       `chunk_gap_ms=${JSON.stringify(stats.notificationGapMs)}`,
       `callback_duration_ms=${JSON.stringify(stats.callbackDurationMs)}`,
       `js_event_loop_lag_ms=${JSON.stringify(stats.jsEventLoopLagMs)}`,
+      `controls_initialized=${controlState.initialized}`,
+      `controls_seen_254=${controlState.seenSwitches}`,
+      `controls_seen_253=${controlState.seenRotary1234}`,
+      `controls_seen_252=${controlState.seenRotary5678}`,
+      `switch_mask=0x${controlState.switchesMask.toString(16).padStart(2, '0').toUpperCase()}`,
+      `rotary_values=${controlState.rotaryValues.join(',')}`,
+      `switch_frame=${frameToHex(controlSynchronizerRef.current.buildSwitchFrame())}`,
+      `tx_switch_polls=${txDiagnostics.switchPolls}`,
+      `tx_switch_queued=${txDiagnostics.switchFramesQueued}`,
+      `tx_switch_sent=${txDiagnostics.switchFramesSent}`,
+      `tx_rtt_requests=${txDiagnostics.latencyRequests}`,
+      `tx_rtt_queued=${txDiagnostics.latencyRepliesQueued}`,
+      `tx_rtt_sent=${txDiagnostics.latencyRepliesSent}`,
+      `tx_errors=${txDiagnostics.txErrors}`,
+      `tx_queue_depth=${txDiagnostics.queueDepth}`,
+      `tx_last_kind=${txDiagnostics.lastTxKind ?? '—'}`,
+      `tx_last_frame=${txDiagnostics.lastTxHex || '—'}`,
+      `tx_last_write_ms=${txDiagnostics.lastWriteDurationMs ?? '—'}`,
+      `tx_last_queue_delay_ms=${txDiagnostics.lastQueueDelayMs ?? '—'}`,
+      `tx_last_error=${txDiagnostics.lastError ?? '—'}`,
       'channels_begin',
       ...channelReportLines,
       'channels_end',
@@ -1376,20 +1776,30 @@ export default function App() {
     classicRxEncoding,
     connectedInfo,
     connectionState,
+    controlState,
     liveChannels,
     stats,
     statusText,
     transportDecodeErrors,
     transportMode,
+    txDiagnostics,
   ]);
 
   useEffect(() => {
     void manager.setLogLevel(LogLevel.None).catch(() => undefined);
 
     const uiTimer = setInterval(() => {
-      setStats(collectorRef.current.snapshot(monotonicNowMs()));
+      const nowMs = monotonicNowMs();
+      setStats(collectorRef.current.snapshot(nowMs));
       setTransportDecodeErrors(transportDecodeErrorsRef.current);
       setClassicRxEncoding(classicRxEncodingRef.current);
+      setTxDiagnostics(
+        txDiagnosticsSnapshot(
+          txDiagnosticsRef.current,
+          nowMs,
+          highPriorityTxQueueRef.current.length + normalPriorityTxQueueRef.current.length,
+        ),
+      );
     }, BLE_CONFIG.uiRefreshMs);
 
     const channelUiTimer = setInterval(() => {
@@ -1450,6 +1860,14 @@ export default function App() {
     !isConnectionBusy && connectionState !== 'scanning' && !hasActiveConnection;
   const canConnectFromList = !connectingRef.current && !hasActiveConnection;
   const canDisconnect = isConnectionBusy || hasActiveConnection;
+  const txWritable =
+    connectedInfo?.transport === 'spp' ||
+    (connectedInfo?.transport === 'ble' && connectedInfo.writeMode !== 'unavailable');
+  const controlsInteractive =
+    connectionState === 'receiving' && controlState.initialized && txWritable;
+  const currentSwitchFrameHex = frameToHex(
+    controlSynchronizerRef.current.buildSwitchFrame(),
+  );
 
   const eventLabel = transportMode === 'ble' ? 'notifications' : 'SPP read callbacks';
   const callbackLabel = transportMode === 'ble' ? 'BLE callback' : 'SPP callback';
@@ -1513,9 +1931,9 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#f2f3f5" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BT RX Stats v1.5</Text>
+        <Text style={styles.title}>ECUMaster BT RX Stats v1.6</Text>
         <Text style={styles.subtitle}>
-          Miernik RX dla BLE/GATT i SPP/RFCOMM z szybkim widokiem wszystkich kanałów. Parser pracuje na każdym odebranym fragmencie, a ekran kanałów odświeża najnowsze wartości z częstotliwością 25 Hz.
+          Miernik RX/TX dla BLE/GATT i SPP/RFCOMM. Oprócz kanałów i statystyk obsługuje 8 przełączników, 8 wartości rotary 0–15 oraz natychmiastową odpowiedź RTT po odebraniu kanału 99.
         </Text>
 
         <View style={styles.card}>
@@ -1524,6 +1942,7 @@ export default function App() {
             {([
               ['connection', 'Połączenie'],
               ['channels', 'Kanały'],
+              ['controls', 'Sterowanie'],
               ['statistics', 'Statystyki'],
             ] as const).map(([view, label]) => (
               <Pressable
@@ -1622,6 +2041,12 @@ export default function App() {
               <Text style={styles.mono}>MTU reported: {connectedInfo.mtu}</Text>
               <Text style={styles.mono}>service: {connectedInfo.serviceUuid}</Text>
               <Text style={styles.mono}>notify: {connectedInfo.notifyCharacteristicUuid}</Text>
+              <Text style={styles.mono}>
+                write service: {connectedInfo.writeServiceUuid ?? '—'}
+              </Text>
+              <Text style={styles.mono}>
+                write: {connectedInfo.writeCharacteristicUuid ?? '—'} | mode: {connectedInfo.writeMode}
+              </Text>
             </View>
           ) : null}
 
@@ -1788,6 +2213,132 @@ export default function App() {
           </>
         ) : null}
 
+        {mainView === 'controls' ? (
+          <>
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Synchronizacja sterowania i TX</Text>
+              <Text style={styles.mono}>
+                transport: {connectedInfo?.transport?.toUpperCase() ?? '—'} | TX:{' '}
+                {txWritable ? 'gotowy' : 'niedostępny'}
+              </Text>
+              <Text style={styles.mono}>
+                ID 254 switches: {controlState.seenSwitches ? 'OK' : 'czekam'} | ID 253 rotary 1–4:{' '}
+                {controlState.seenRotary1234 ? 'OK' : 'czekam'} | ID 252 rotary 5–8:{' '}
+                {controlState.seenRotary5678 ? 'OK' : 'czekam'}
+              </Text>
+              <Text style={styles.mono}>
+                stan inicjalny: {controlState.initialized ? 'GOTOWY' : 'NIEGOTOWY'} | maska:{' '}
+                0x{controlState.switchesMask.toString(16).padStart(2, '0').toUpperCase()}
+              </Text>
+              <Text style={styles.mono}>następna ramka 0x55: {currentSwitchFrameHex}</Text>
+              <Text style={styles.note}>
+                Aplikacja najpierw jednorazowo odczytuje stan z kanałów 254, 253 i 252. Po
+                inicjalizacji każde kolejne odebranie ID 254 kolejkuje aktualną 8-bajtową ramkę
+                magic=0x55. Naciśnięcie przycisku zmienia stan lokalny; transmisja następuje przy
+                następnym ID 254. Każde ID 99 natychmiast kolejkuje odpowiedź magic=0x56 z
+                priorytetem przed ramkami switchy.
+              </Text>
+              <View style={styles.buttonRow}>
+                <View style={styles.buttonCell}>
+                  <Button
+                    title="Synchronizuj ponownie"
+                    onPress={resynchronizeControls}
+                    disabled={!hasActiveConnection}
+                  />
+                </View>
+                <View style={styles.buttonCell}>
+                  <Button title="Udostępnij raport" onPress={() => void shareReport()} />
+                </View>
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>8 switchy On / Off</Text>
+              <View style={styles.binaryControlGrid}>
+                {Array.from({ length: 8 }, (_, index) => {
+                  const isOn = (controlState.switchesMask & (1 << index)) !== 0;
+                  return (
+                    <Pressable
+                      key={`switch-${index}`}
+                      disabled={!controlsInteractive}
+                      onPress={() => toggleControlSwitch(index)}
+                      style={[
+                        styles.binaryControl,
+                        isOn ? styles.binaryControlOn : styles.binaryControlOff,
+                        !controlsInteractive && styles.disabledControl,
+                      ]}
+                    >
+                      <Text style={styles.controlName}>Switch {index + 1}</Text>
+                      <Text
+                        style={[
+                          styles.binaryControlValue,
+                          isOn ? styles.binaryControlValueOn : styles.binaryControlValueOff,
+                        ]}
+                      >
+                        {isOn ? 'ON' : 'OFF'}
+                      </Text>
+                      <Text style={styles.controlHint}>bit {index}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>8 rotary 4-bit, zakres 0–15</Text>
+              <Text style={styles.note}>
+                Każde naciśnięcie zwiększa wartość o 1; po 15 następuje zawinięcie do 0.
+              </Text>
+              <View style={styles.rotaryControlGrid}>
+                {controlState.rotaryValues.map((value, index) => (
+                  <Pressable
+                    key={`rotary-${index}`}
+                    disabled={!controlsInteractive}
+                    onPress={() => incrementControlRotary(index)}
+                    style={[
+                      styles.rotaryControl,
+                      !controlsInteractive && styles.disabledControl,
+                    ]}
+                  >
+                    <Text style={styles.controlName}>Rotary {index + 1}</Text>
+                    <Text style={styles.rotaryControlValue}>{value}</Text>
+                    <Text style={styles.controlHint}>naciśnij +1</Text>
+                  </Pressable>
+                ))}
+              </View>
+            </View>
+
+            <View style={styles.card}>
+              <Text style={styles.sectionTitle}>Statystyki TX i round-trip</Text>
+              <Text style={styles.mono}>
+                ID 254 polls: {txDiagnostics.switchPolls} | status queued:{' '}
+                {txDiagnostics.switchFramesQueued} | sent: {txDiagnostics.switchFramesSent}
+              </Text>
+              <Text style={styles.mono}>
+                ID 99 requests: {txDiagnostics.latencyRequests} | replies queued:{' '}
+                {txDiagnostics.latencyRepliesQueued} | sent: {txDiagnostics.latencyRepliesSent}
+              </Text>
+              <Text style={styles.mono}>
+                queue depth: {txDiagnostics.queueDepth} | TX errors: {txDiagnostics.txErrors}
+              </Text>
+              <Text style={styles.mono}>
+                last: {txDiagnostics.lastTxKind ?? '—'} | age:{' '}
+                {formatNumber(txDiagnostics.lastTxAgoMs, 1)} ms | write:{' '}
+                {formatNumber(txDiagnostics.lastWriteDurationMs, 2)} ms | queue delay:{' '}
+                {formatNumber(txDiagnostics.lastQueueDelayMs, 2)} ms
+              </Text>
+              <Text style={styles.mono}>last frame: {txDiagnostics.lastTxHex || '—'}</Text>
+              {txDiagnostics.lastError !== null ? (
+                <Text style={styles.error}>TX: {txDiagnostics.lastError}</Text>
+              ) : null}
+              <Text style={styles.note}>
+                Odpowiedź RTT ma bajty: 08 56 CF 00 00 00 00 2D. Wartość -49 jest kodowana
+                jako uint8_t 0xCF, a checksum jest sumą pierwszych siedmiu bajtów modulo 256.
+              </Text>
+            </View>
+          </>
+        ) : null}
+
         {mainView === 'statistics' ? (
           <>
         <View style={styles.card}>
@@ -1834,6 +2385,27 @@ export default function App() {
         </View>
 
         <View style={styles.card}>
+          <Text style={styles.sectionTitle}>TX: switch status i RTT</Text>
+          <Text style={styles.mono}>
+            control initialized: {controlState.initialized ? 'yes' : 'no'} | TX ready:{' '}
+            {txWritable ? 'yes' : 'no'} | queue: {txDiagnostics.queueDepth}
+          </Text>
+          <Text style={styles.mono}>
+            switch polls/queued/sent: {txDiagnostics.switchPolls}/
+            {txDiagnostics.switchFramesQueued}/{txDiagnostics.switchFramesSent}
+          </Text>
+          <Text style={styles.mono}>
+            RTT requests/queued/sent: {txDiagnostics.latencyRequests}/
+            {txDiagnostics.latencyRepliesQueued}/{txDiagnostics.latencyRepliesSent}
+          </Text>
+          <Text style={styles.mono}>
+            TX errors: {txDiagnostics.txErrors} | last write:{' '}
+            {formatNumber(txDiagnostics.lastWriteDurationMs, 2)} ms | queue delay:{' '}
+            {formatNumber(txDiagnostics.lastQueueDelayMs, 2)} ms
+          </Text>
+        </View>
+
+        <View style={styles.card}>
           <Text style={styles.sectionTitle}>Kanały kontrolne</Text>
           <ChannelRow label="RPM" value={stats.rpm} />
           <ChannelRow label="IAT" value={stats.iat} />
@@ -1851,7 +2423,7 @@ export default function App() {
             JS event-loop lag [ms]: {formatDistribution(stats.jsEventLoopLagMs)}
           </Text>
           <Text style={styles.note}>
-            Widok statystyk odświeża się 2 razy/s, a lekki widok kanałów 25 razy/s. Callback odbiorczy wyłącznie dekoduje dane, aktualizuje liczniki i wraca — bez logowania, zapisu pliku i setState dla każdej ramki.
+            Widok statystyk odświeża się 2 razy/s, a lekki widok kanałów 25 razy/s. Callback odbiorczy dekoduje dane, aktualizuje liczniki i kolejkuje krótkie ramki TX; zapis do BLE/SPP jest serializowany poza parserem. Nie ma logowania ani zapisu pliku per ramka.
           </Text>
         </View>
 
@@ -1864,6 +2436,12 @@ export default function App() {
               <Text style={styles.mono}>scan mode: LowLatency</Text>
               <Text style={styles.mono}>requested MTU: {BLE_CONFIG.requestedMtu}</Text>
               <Text style={styles.mono}>connection priority: HIGH</Text>
+              <Text style={styles.mono}>
+                write characteristic: {connectedInfo?.transport === 'ble' ? connectedInfo.writeCharacteristicUuid ?? '—' : '—'}
+              </Text>
+              <Text style={styles.mono}>
+                write mode: {connectedInfo?.transport === 'ble' ? connectedInfo.writeMode : '—'}
+              </Text>
             </>
           ) : (
             <>
@@ -1879,6 +2457,9 @@ export default function App() {
           <Text style={styles.mono}>
             expected: RPM {BLE_CONFIG.expectedRatesHz.rpm} Hz, IAT/CLT{' '}
             {BLE_CONFIG.expectedRatesHz.clt} Hz
+          </Text>
+          <Text style={styles.mono}>
+            TX protocol: 8 B | magic 0x55 switch status | magic 0x56 RTT reply
           </Text>
           <Text style={styles.note}>
             „rate vs nominal” jest estymacją z deklarowanych częstotliwości. Bez licznika sekwencyjnego w protokole nie da się bezpośrednio policzyć utraconych pakietów.
@@ -1969,7 +2550,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#f3f4f6',
   },
   mainViewButtonText: {
-    fontSize: 12,
+    fontSize: 10,
     fontWeight: '700',
     color: '#111827',
   },
@@ -2006,6 +2587,78 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     color: '#111827',
+  },
+  binaryControlGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  binaryControl: {
+    width: '48.5%',
+    minHeight: 92,
+    borderWidth: 1,
+    borderRadius: 8,
+    padding: 10,
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 3,
+  },
+  binaryControlOn: {
+    backgroundColor: '#dcfce7',
+    borderColor: '#16a34a',
+  },
+  binaryControlOff: {
+    backgroundColor: '#f3f4f6',
+    borderColor: '#9ca3af',
+  },
+  binaryControlValue: {
+    fontSize: 25,
+    lineHeight: 30,
+    fontWeight: '800',
+  },
+  binaryControlValueOn: {
+    color: '#15803d',
+  },
+  binaryControlValueOff: {
+    color: '#4b5563',
+  },
+  rotaryControlGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+  },
+  rotaryControl: {
+    width: '23.5%',
+    minHeight: 100,
+    borderWidth: 1,
+    borderColor: '#2563eb',
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    paddingVertical: 9,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#eff6ff',
+    gap: 3,
+  },
+  rotaryControlValue: {
+    fontFamily: Platform.select({ android: 'monospace', default: 'Courier' }),
+    fontSize: 29,
+    lineHeight: 34,
+    fontWeight: '800',
+    color: '#1d4ed8',
+  },
+  controlName: {
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: '700',
+    textAlign: 'center',
+    color: '#111827',
+  },
+  controlHint: {
+    fontSize: 10,
+    lineHeight: 13,
+    textAlign: 'center',
+    color: '#4b5563',
   },
   channelDashboardCard: {
     padding: 6,

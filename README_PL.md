@@ -1,92 +1,69 @@
-# ECUMaster BT RX Stats v1.5
+# ECUMaster BT RX/TX Stats v1.6
 
-Minimalna aplikacja diagnostyczna dla Androida służąca do porównania odbioru tego samego strumienia telemetrycznego przez:
+Aplikacja diagnostyczna dla Androida do testowania tego samego strumienia telemetrycznego przez:
 
 - **BLE/GATT** — `react-native-ble-plx`,
 - **SPP/RFCOMM (Bluetooth Classic)** — `react-native-bluetooth-classic`.
 
-Aplikacja nie aktualizuje interfejsu dla każdej ramki, nie zapisuje strumienia do pliku i nie wykonuje transmisji zwrotnej podczas testu. Surowe dane są od razu przekazywane do lekkiego licznika i parsera, ekran statystyk odświeża się co 500 ms, a lekki widok wszystkich kanałów co 40 ms (25 Hz).
+Parser pracuje natychmiast dla każdego callbacku, ekran kanałów odświeża się co 40 ms (25 Hz), a widok statystyk co 500 ms. Aplikacja nie loguje ani nie zapisuje do pliku każdej odebranej ramki.
 
-## Co dodano w v1.3
+## Nowość w v1.6 — switche, rotary i RTT
 
-- wybór transportu **BLE/GATT** albo **SPP/RFCOMM** przed skanowaniem;
-- osobne listy urządzeń BLE oraz Bluetooth Classic/DUAL;
-- dla SPP najpierw wyświetlane są urządzenia już sparowane, a następnie wynik discovery;
-- możliwość sparowania urządzenia SPP z poziomu aplikacji;
-- połączenie SPP w trybie binarnym RFCOMM;
-- najpierw próba bezpiecznego socketu RFCOMM, potem automatyczny fallback do socketu insecure;
-- `READ_SIZE=8192`, `READ_TIMEOUT=0`;
-- dekodowanie danych binarnych Base64 przekazanych przez natywny bridge React Native;
-- wspólny parser strumieniowy obsługujący ramkę podzieloną między dowolne callbacki SPP;
-- osobny opis transportu i parametrów socketu w raporcie.
+Dodano zakładkę **Sterowanie** z:
 
+- 8 przełącznikami On/Off, kodowanymi w jednym bajcie `switches`;
+- 8 wartościami rotary 0–15, po 4 bity każda;
+- zwiększaniem rotary o 1 po naciśnięciu i zawijaniem `15 → 0`;
+- statystykami transmisji zwrotnej;
+- automatyczną odpowiedzią na kanał 99 do pomiaru round-trip time.
 
-## Widok kanałów v1.5
+Po każdym nowym połączeniu aplikacja czeka na jednorazowe odebranie:
 
-- trzy kanały w każdym rzędzie;
-- nazwa, przeliczona wartość z jednostką i częstotliwość z ostatnich 5 sekund;
-- 72 definicje wygenerowane z dostarczonego `EcumasterDASHPro.ts`;
-- poprawna interpretacja 16-bitowych wartości ze znakiem dla kanałów o zakresie ujemnym;
-- wszystkie aktywne, niezdefiniowane ID są dopisywane jako `Kanał niezdefiniowany` z wartością RAW;
-- parser pracuje event-driven, natomiast React odświeża ekran kanałów z częstotliwością 25 Hz, aby nie wykonywać setState dla każdej z około 675 ramek na sekundę;
-- szare pole oznacza kanał jeszcze nieodebrany, żółte — aktywne ID bez definicji, czerwone obramowanie — kanał chwilowo nieaktualny;
-- raport tekstowy zawiera dla każdego aktywnego ID nazwę, wartość, RAW, częstotliwość średnią i 5-sekundową, count oraz age.
+- ID 254 — najniższe 8 bitów inicjalizuje switche 1–8;
+- ID 253 — cztery nibble inicjalizują rotary 1–4;
+- ID 252 — cztery nibble inicjalizują rotary 5–8.
 
-## BLE/GATT
-
-- skan nie filtruje po nazwie, MAC ani UUID;
-- ręczny wybór urządzenia z listy;
-- skan w trybie `LowLatency`;
-- żądanie `ConnectionPriority.High`;
-- żądanie MTU 247 i prezentacja wartości zwróconej przez bibliotekę;
-- preferowana usługa FFE0 oraz charakterystyka notify FFE1, z fallbackiem do pierwszej charakterystyki notify/indicate;
-- brak zapisów do urządzenia.
-
-## SPP/RFCOMM
-
-Najwygodniej sparować moduł wcześniej w ustawieniach Bluetooth Androida. Po wybraniu **SPP/RFCOMM** i kliknięciu **Skanuj SPP** urządzenia sparowane powinny pojawić się od razu na górze listy. Pełne discovery urządzeń niesparowanych może trwać kilkanaście sekund.
-
-Dla SPP jeden callback nie jest pakietem protokołu. Może zawierać część ramki, jedną ramkę albo wiele ramek. Dlatego licznik:
+Dopiero po odebraniu wszystkich trzech kanałów sterowanie staje się aktywne. Ramka ID 254, która ewentualnie kończy inicjalizację, nie wyzwala odpowiedzi. Każde **kolejne** ID 254 powoduje wysłanie aktualnego stanu:
 
 ```text
-chunk len % 5 != 0
+byte 0: 8
+byte 1: 0x55
+byte 2: switches 1–8
+byte 3: rotary 1 w high nibble, rotary 2 w low nibble
+byte 4: rotary 3 / rotary 4
+byte 5: rotary 5 / rotary 6
+byte 6: rotary 7 / rotary 8
+byte 7: suma bajtów 0–6 modulo 256
 ```
 
-może być większy od zera i sam w sobie nie oznacza błędu. Parser zachowuje końcówkę callbacku i łączy ją z kolejnymi danymi. Istotne są przede wszystkim:
+Naciśnięcie kontrolki zmienia stan lokalny. Nowa wartość jest wysyłana przy następnym odebraniu kanału 254.
 
-- `checksum errors`,
-- `resync dropped bytes`,
-- końcowe `carry bytes`,
-- częstotliwości RPM/IAT/CLT,
-- B/s oraz frames/s,
-- rozkład przerw pomiędzy callbackami.
+Po każdym poprawnym odebraniu kanału **99** aplikacja kolejkuje z najwyższym priorytetem ramkę:
 
-## Statystyki wspólne dla BLE i SPP
+```text
+08 56 CF 00 00 00 00 2D
+```
 
-- liczba callbacków, bajtów i poprawnych ramek;
-- średnia oraz chwilowa szybkość odbioru;
-- histogram rozmiarów callbacków/chunków;
-- czasy przerw p50/p95/p99/max;
-- checksum i resynchronizacja parsera;
-- RPM, IAT i CLT;
-- liczba wystąpień każdego ID 0–255;
-- czas wykonania callbacku oraz opóźnienie pętli JavaScript;
-- raport tekstowy przez systemową funkcję „Udostępnij”.
+`0xCF` to zapis `-49` w `uint8_t`. Ramki RTT mają pierwszeństwo przed oczekującymi ramkami statusu switchy. Wszystkie zapisy są serializowane, aby nie wykonywać równoległych operacji GATT/RFCOMM.
 
-Dla dotychczasowego źródła danych wartości nominalne wynoszą około 25 Hz dla RPM oraz 6,25 Hz dla IAT i CLT. Pole `rate vs nominal` nie jest prawdziwym licznikiem utraconych pakietów — bez licznika sekwencji pokazuje wyłącznie relację częstotliwości odebranej do zadanej.
+Mechanizm TX działa dla aktualnie połączonego transportu:
+
+- BLE: preferowana charakterystyka FFE2; fallback do zapisywalnej charakterystyki w usłudze RX, a następnie do dowolnej zapisywalnej charakterystyki;
+- SPP: zapis binarny do aktywnego socketu RFCOMM.
+
+## Widoki
+
+- **Połączenie** — wybór BLE/SPP, skanowanie i łączenie;
+- **Kanały** — trzy kanały w rzędzie, wartość, jednostka i częstotliwość z ostatnich 5 s;
+- **Sterowanie** — 8 switchy, 8 rotary i statystyki TX/RTT;
+- **Statystyki** — przepływność, integralność parsera, częstotliwości, obciążenie JS i TX.
 
 ## Budowanie APK
 
-Repozytorium zawiera workflow:
-
-```text
-.github/workflows/android-apk.yml
-```
-
-Po zmianie plików uruchom **nowe** wykonanie przez:
+Po przesłaniu plików do repozytorium uruchom nowe wykonanie:
 
 ```text
 Actions → Build Android APK → Run workflow → main → Run workflow
 ```
 
-Nie używaj `Re-run` starego wykonania, ponieważ GitHub zbuduje wtedy poprzedni commit.
+Nie wybieraj `Re-run` poprzedniego wykonania, ponieważ GitHub zbuduje wtedy wcześniejszy commit.

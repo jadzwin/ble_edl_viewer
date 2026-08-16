@@ -102,6 +102,11 @@ export interface ChannelStatsSnapshot {
   lastSeenAgoMs: number | null;
 }
 
+export interface ParsedChannelFrame {
+  id: number;
+  raw: number;
+}
+
 export interface ChannelLiveSnapshot {
   id: number;
   count: number;
@@ -254,7 +259,7 @@ export class BleStatsCollector {
     }
   }
 
-  ingestNotification(payload: Uint8Array, nowMs: number): void {
+  ingestNotification(payload: Uint8Array, nowMs: number): ParsedChannelFrame[] {
     if (this.startedAtMs === 0) {
       this.startedAtMs = nowMs;
     }
@@ -286,6 +291,7 @@ export class BleStatsCollector {
 
     let offset = 0;
     let framesFromThisCallback = 0;
+    const parsedFrames: ParsedChannelFrame[] = [];
 
     while (combined.length - offset >= 5) {
       const id = combined[offset] ?? 0;
@@ -316,6 +322,7 @@ export class BleStatsCollector {
       this.channelLastSeenMs[id] = nowMs;
 
       this.recentChannelTimesMs[id]?.push(nowMs);
+      parsedFrames.push({ id, raw });
 
       offset += 5;
     }
@@ -328,6 +335,7 @@ export class BleStatsCollector {
     });
 
     this.pruneRecent(nowMs);
+    return parsedFrames;
   }
 
   private pruneRecent(nowMs: number): void {
