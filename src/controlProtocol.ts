@@ -35,6 +35,15 @@ function clampNibble(value: number): number {
   return value & 0x0f;
 }
 
+function reverseBits8(value: number): number {
+  let reversed = 0;
+  const byte = value & 0xff;
+  for (let bit = 0; bit < 8; bit += 1) {
+    reversed |= ((byte >>> bit) & 1) << (7 - bit);
+  }
+  return reversed;
+}
+
 function splitRotaryWord(rawUnsigned: number): [number, number, number, number] {
   const raw = rawUnsigned & 0xffff;
   return [
@@ -69,7 +78,7 @@ export function buildSwitchStatusFrame(
   const frame = new Uint8Array(CONTROL_FRAME_LENGTH);
   frame[0] = CONTROL_FRAME_LENGTH;
   frame[1] = SWITCH_STATUS_MAGIC;
-  frame[2] = switchesMask & 0xff;
+  frame[2] = reverseBits8(switchesMask);
   frame[3] = packRotaryPair(rotaryValues[0] ?? 0, rotaryValues[1] ?? 0);
   frame[4] = packRotaryPair(rotaryValues[2] ?? 0, rotaryValues[3] ?? 0);
   frame[5] = packRotaryPair(rotaryValues[4] ?? 0, rotaryValues[5] ?? 0);
@@ -134,7 +143,7 @@ export class ControlStateSynchronizer {
     // Po inicjalizacji każde kolejne ID 254 jest traktowane jako poll TX.
     if (!wasInitialized) {
       if (id === CONTROL_CHANNEL_IDS.switches) {
-        this.switchesMask = rawUnsigned & 0xff;
+        this.switchesMask = reverseBits8(rawUnsigned);
         this.seenSwitches = true;
         stateChanged = true;
       } else if (id === CONTROL_CHANNEL_IDS.rotary1234) {
