@@ -247,6 +247,10 @@ export class BleStatsCollector {
     }
   }
 
+  getValidFrameCount(): number {
+    return this.validFrames;
+  }
+
   recordCallbackDuration(durationMs: number): void {
     if (Number.isFinite(durationMs) && durationMs >= 0) {
       this.callbackDurations.push(durationMs);

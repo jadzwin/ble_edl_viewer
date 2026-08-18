@@ -50,6 +50,10 @@ type MainView = 'connection' | 'channels' | 'controls' | 'statistics';
 type ClassicDeviceType = 'CLASSIC' | 'LOW_ENERGY' | 'DUAL' | 'UNKNOWN';
 type ClassicRxEncoding = 'unknown' | 'base64' | 'binary-string';
 
+const FRAME_RATE_CHART_SECONDS = 60;
+const FRAME_RATE_CHART_MAX = 700;
+const FRAME_RATE_CHART_HEIGHT = 180;
+
 type ConnectionState =
   | 'idle'
   | 'waiting-for-bluetooth'
@@ -604,6 +608,66 @@ function ChannelRow({ label, value }: { label: string; value: ChannelStatsSnapsh
   );
 }
 
+function FrameRateChart({ samples }: { samples: readonly number[] }) {
+  const latest = samples[samples.length - 1] ?? 0;
+
+  return (
+    <View>
+      <View style={styles.chartHeaderRow}>
+        <Text style={styles.mono}>Odebrane kanały / s</Text>
+        <Text style={styles.mono}>teraz: {latest}/s</Text>
+      </View>
+      <View style={styles.chartBody}>
+        <View style={styles.chartYAxis}>
+          {[700, 525, 350, 175, 0].map((value) => (
+            <Text key={value} style={styles.chartAxisLabel}>
+              {value}
+            </Text>
+          ))}
+        </View>
+        <View style={styles.chartPlot}>
+          {[0, 0.25, 0.5, 0.75, 1].map((position) => (
+            <View
+              key={position}
+              style={[styles.chartGridLine, { top: position * FRAME_RATE_CHART_HEIGHT }]}
+            />
+          ))}
+          <View style={styles.chartBars}>
+            {samples.map((value, index) => {
+              const height =
+                (Math.min(FRAME_RATE_CHART_MAX, Math.max(0, value)) /
+                  FRAME_RATE_CHART_MAX) *
+                FRAME_RATE_CHART_HEIGHT;
+              return (
+                <View key={index} style={styles.chartBarCell}>
+                  <View
+                    style={[
+                      styles.chartBar,
+                      value > FRAME_RATE_CHART_MAX && styles.chartBarOverflow,
+                      { height },
+                    ]}
+                  />
+                </View>
+              );
+            })}
+          </View>
+        </View>
+      </View>
+      <View style={styles.chartXAxisRow}>
+        <Text style={styles.chartAxisLabel}>-60</Text>
+        <Text style={styles.chartAxisLabel}>-45</Text>
+        <Text style={styles.chartAxisLabel}>-30</Text>
+        <Text style={styles.chartAxisLabel}>-15</Text>
+        <Text style={styles.chartAxisLabel}>0 s</Text>
+      </View>
+      <Text style={styles.note}>
+        Każdy słupek pokazuje liczbę poprawnie odebranych kanałów w jednej sekundzie.
+        Wykres przesuwa się i przechowuje ostatnie 60 sekund.
+      </Text>
+    </View>
+  );
+}
+
 const ChannelTile = React.memo(
   function ChannelTileView({
     model,
@@ -703,6 +767,10 @@ export default function App() {
   const [bleScanDevices, setBleScanDevices] = useState<BleScanDeviceRow[]>([]);
   const [sppScanDevices, setSppScanDevices] = useState<SppScanDeviceRow[]>([]);
   const [stats, setStats] = useState<BleStatsSnapshot>(() => emptySnapshot());
+  const [frameRateHistory, setFrameRateHistory] = useState<number[]>(() =>
+    Array(FRAME_RATE_CHART_SECONDS).fill(0),
+  );
+  const lastChartFrameCountRef = useRef(0);
   const [liveChannels, setLiveChannels] = useState<ChannelLiveSnapshot[]>([]);
   const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
   const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
@@ -818,11 +886,13 @@ export default function App() {
 
   const resetStats = useCallback(() => {
     collectorRef.current.reset(monotonicNowMs());
+    lastChartFrameCountRef.current = 0;
     transportDecodeErrorsRef.current = 0;
     classicRxEncodingRef.current = 'unknown';
     setTransportDecodeErrors(0);
     setClassicRxEncoding('unknown');
     setStats(emptySnapshot());
+    setFrameRateHistory(Array(FRAME_RATE_CHART_SECONDS).fill(0));
     setLiveChannels([]);
   }, []);
 
@@ -1811,6 +1881,19 @@ export default function App() {
       }
     }, BLE_CONFIG.channelUiRefreshMs);
 
+    const frameRateChartTimer = setInterval(() => {
+      const currentFrameCount = collectorRef.current.getValidFrameCount();
+      const framesSinceLastSample = Math.max(
+        0,
+        currentFrameCount - lastChartFrameCountRef.current,
+      );
+      lastChartFrameCountRef.current = currentFrameCount;
+      setFrameRateHistory((previous) => [
+        ...previous.slice(-(FRAME_RATE_CHART_SECONDS - 1)),
+        framesSinceLastSample,
+      ]);
+    }, 1000);
+
     const lagIntervalMs = 100;
     let nextExpected = monotonicNowMs() + lagIntervalMs;
     const lagTimer = setInterval(() => {
@@ -1827,6 +1910,7 @@ export default function App() {
       intentionalDisconnectRef.current = true;
       clearInterval(uiTimer);
       clearInterval(channelUiTimer);
+      clearInterval(frameRateChartTimer);
       clearInterval(lagTimer);
       stopBleScan();
       void cancelSppDiscovery(true);
@@ -2342,6 +2426,11 @@ export default function App() {
         {mainView === 'statistics' ? (
           <>
         <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Kanały odebrane na sekundę</Text>
+          <FrameRateChart samples={frameRateHistory} />
+        </View>
+
+        <View style={styles.card}>
           <Text style={styles.sectionTitle}>Transport</Text>
           <Text style={styles.mono}>czas: {formatNumber(stats.elapsedSeconds, 1)} s</Text>
           <Text style={styles.mono}>
@@ -2587,6 +2676,67 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     color: '#111827',
+  },
+  chartHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  chartBody: {
+    flexDirection: 'row',
+  },
+  chartYAxis: {
+    width: 34,
+    height: FRAME_RATE_CHART_HEIGHT,
+    justifyContent: 'space-between',
+    alignItems: 'flex-end',
+    paddingRight: 5,
+  },
+  chartPlot: {
+    flex: 1,
+    height: FRAME_RATE_CHART_HEIGHT,
+    borderLeftWidth: StyleSheet.hairlineWidth,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderColor: '#6b7280',
+    overflow: 'hidden',
+  },
+  chartGridLine: {
+    position: 'absolute',
+    left: 0,
+    right: 0,
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: '#d1d5db',
+  },
+  chartBars: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+  },
+  chartBarCell: {
+    flex: 1,
+    height: FRAME_RATE_CHART_HEIGHT,
+    justifyContent: 'flex-end',
+    alignItems: 'center',
+  },
+  chartBar: {
+    width: '65%',
+    minHeight: 1,
+    backgroundColor: '#2563eb',
+  },
+  chartBarOverflow: {
+    backgroundColor: '#dc2626',
+  },
+  chartXAxisRow: {
+    marginLeft: 34,
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingTop: 3,
+  },
+  chartAxisLabel: {
+    fontFamily: Platform.select({ android: 'monospace', default: 'Courier' }),
+    fontSize: 10,
+    lineHeight: 12,
+    color: '#4b5563',
   },
   binaryControlGrid: {
     flexDirection: 'row',
