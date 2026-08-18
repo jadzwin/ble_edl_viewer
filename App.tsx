@@ -15,6 +15,7 @@ import {
   View,
 } from 'react-native';
 import { fromByteArray, toByteArray } from 'base64-js';
+import { useKeepAwake } from 'expo-keep-awake';
 import {
   BleError,
   BleManager,
@@ -718,6 +719,8 @@ const ChannelTile = React.memo(
 );
 
 export default function App() {
+  useKeepAwake();
+
   const manager = useMemo(() => new BleManager(), []);
   const collectorRef = useRef(new BleStatsCollector());
   const { width: windowWidth } = useWindowDimensions();
@@ -771,6 +774,11 @@ export default function App() {
     Array(FRAME_RATE_CHART_SECONDS).fill(0),
   );
   const lastChartFrameCountRef = useRef(0);
+  const frameRateRangeSamplingReadyRef = useRef(false);
+  const [frameRateRange, setFrameRateRange] = useState<{
+    min: number | null;
+    max: number | null;
+  }>({ min: null, max: null });
   const [liveChannels, setLiveChannels] = useState<ChannelLiveSnapshot[]>([]);
   const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
   const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
@@ -887,12 +895,14 @@ export default function App() {
   const resetStats = useCallback(() => {
     collectorRef.current.reset(monotonicNowMs());
     lastChartFrameCountRef.current = 0;
+    frameRateRangeSamplingReadyRef.current = false;
     transportDecodeErrorsRef.current = 0;
     classicRxEncodingRef.current = 'unknown';
     setTransportDecodeErrors(0);
     setClassicRxEncoding('unknown');
     setStats(emptySnapshot());
     setFrameRateHistory(Array(FRAME_RATE_CHART_SECONDS).fill(0));
+    setFrameRateRange({ min: null, max: null });
     setLiveChannels([]);
   }, []);
 
@@ -1888,6 +1898,22 @@ export default function App() {
         currentFrameCount - lastChartFrameCountRef.current,
       );
       lastChartFrameCountRef.current = currentFrameCount;
+
+      const connected = connectedTransportRef.current !== null;
+      if (connected && frameRateRangeSamplingReadyRef.current) {
+        setFrameRateRange((previous) => ({
+          min:
+            previous.min === null
+              ? framesSinceLastSample
+              : Math.min(previous.min, framesSinceLastSample),
+          max:
+            previous.max === null
+              ? framesSinceLastSample
+              : Math.max(previous.max, framesSinceLastSample),
+        }));
+      }
+      frameRateRangeSamplingReadyRef.current = connected;
+
       setFrameRateHistory((previous) => [
         ...previous.slice(-(FRAME_RATE_CHART_SECONDS - 1)),
         framesSinceLastSample,
@@ -2446,6 +2472,10 @@ export default function App() {
             valid frames: {stats.validFrames} | avg{' '}
             {formatNumber(stats.validFramesPerSecondAverage, 2)}/s | last 1s{' '}
             {stats.validFramesPerSecond1s}/s
+          </Text>
+          <Text style={styles.mono}>
+            valid frames/s min: {formatNumber(frameRateRange.min, 0)} | max:{' '}
+            {formatNumber(frameRateRange.max, 0)}
           </Text>
           <Text style={styles.mono}>length histogram: {histogramText}</Text>
           <Text style={styles.mono}>active channel IDs: {stats.channelCounts.length}</Text>
