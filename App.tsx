@@ -51,7 +51,7 @@ type ClassicDeviceType = 'CLASSIC' | 'LOW_ENERGY' | 'DUAL' | 'UNKNOWN';
 type ClassicRxEncoding = 'unknown' | 'base64' | 'binary-string';
 
 const FRAME_RATE_CHART_SECONDS = 60;
-const FRAME_RATE_CHART_MAX = 700;
+const FRAME_RATE_CHART_MAX = 1000;
 const FRAME_RATE_CHART_HEIGHT = 180;
 
 type ConnectionState =
@@ -619,7 +619,7 @@ function FrameRateChart({ samples }: { samples: readonly number[] }) {
       </View>
       <View style={styles.chartBody}>
         <View style={styles.chartYAxis}>
-          {[700, 525, 350, 175, 0].map((value) => (
+          {[1000, 750, 500, 250, 0].map((value) => (
             <Text key={value} style={styles.chartAxisLabel}>
               {value}
             </Text>
