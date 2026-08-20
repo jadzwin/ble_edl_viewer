@@ -10,6 +10,7 @@ import {
   Share,
   StatusBar,
   StyleSheet,
+  Switch,
   Text,
   useWindowDimensions,
   View,
@@ -50,6 +51,7 @@ type TransportMode = 'ble' | 'spp';
 type MainView = 'connection' | 'channels' | 'controls' | 'statistics';
 type ClassicDeviceType = 'CLASSIC' | 'LOW_ENERGY' | 'DUAL' | 'UNKNOWN';
 type ClassicRxEncoding = 'unknown' | 'base64' | 'binary-string';
+type BleConnectionPriorityName = 'LOW_POWER' | 'BALANCED' | 'HIGH';
 
 const FRAME_RATE_CHART_SECONDS = 60;
 const FRAME_RATE_CHART_MAX = 1000;
@@ -204,6 +206,9 @@ interface TxDiagnosticsSnapshot {
   latencyRequests: number;
   latencyRepliesQueued: number;
   latencyRepliesSent: number;
+  txSuppressedTotal: number;
+  latencyRepliesSuppressed: number;
+  switchFramesSuppressed: number;
   txErrors: number;
   queueDepth: number;
   lastTxKind: TxFrameKind | null;
@@ -221,6 +226,9 @@ interface TxDiagnosticsMutable {
   latencyRequests: number;
   latencyRepliesQueued: number;
   latencyRepliesSent: number;
+  txSuppressedTotal: number;
+  latencyRepliesSuppressed: number;
+  switchFramesSuppressed: number;
   txErrors: number;
   lastTxKind: TxFrameKind | null;
   lastTxHex: string;
@@ -232,6 +240,20 @@ interface TxDiagnosticsMutable {
 
 const SPP_READ_SIZE = 8192;
 
+const BLE_CONNECTION_PRIORITIES: ReadonlyArray<{
+  name: BleConnectionPriorityName;
+  value: ConnectionPriority;
+}> = [
+  { name: 'LOW_POWER', value: ConnectionPriority.LowPower },
+  { name: 'BALANCED', value: ConnectionPriority.Balanced },
+  { name: 'HIGH', value: ConnectionPriority.High },
+];
+
+function connectionPriorityValue(name: BleConnectionPriorityName): ConnectionPriority {
+  return BLE_CONNECTION_PRIORITIES.find((priority) => priority.name === name)?.value
+    ?? ConnectionPriority.Balanced;
+}
+
 function emptyTxDiagnosticsMutable(): TxDiagnosticsMutable {
   return {
     switchPolls: 0,
@@ -240,6 +262,9 @@ function emptyTxDiagnosticsMutable(): TxDiagnosticsMutable {
     latencyRequests: 0,
     latencyRepliesQueued: 0,
     latencyRepliesSent: 0,
+    txSuppressedTotal: 0,
+    latencyRepliesSuppressed: 0,
+    switchFramesSuppressed: 0,
     txErrors: 0,
     lastTxKind: null,
     lastTxHex: '',
@@ -262,6 +287,9 @@ function txDiagnosticsSnapshot(
     latencyRequests: value.latencyRequests,
     latencyRepliesQueued: value.latencyRepliesQueued,
     latencyRepliesSent: value.latencyRepliesSent,
+    txSuppressedTotal: value.txSuppressedTotal,
+    latencyRepliesSuppressed: value.latencyRepliesSuppressed,
+    switchFramesSuppressed: value.switchFramesSuppressed,
     txErrors: value.txErrors,
     queueDepth,
     lastTxKind: value.lastTxKind,
@@ -758,6 +786,7 @@ export default function App() {
   const txProcessingRef = useRef(false);
   const txGenerationRef = useRef(0);
   const txDiagnosticsRef = useRef<TxDiagnosticsMutable>(emptyTxDiagnosticsMutable());
+  const bleTxEnabledRef = useRef(true);
 
   const [transportMode, setTransportMode] = useState<TransportMode>('ble');
   const [mainView, setMainView] = useState<MainView>('connection');
@@ -782,6 +811,15 @@ export default function App() {
   const [liveChannels, setLiveChannels] = useState<ChannelLiveSnapshot[]>([]);
   const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
   const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
+  const [bleTxEnabled, setBleTxEnabled] = useState(true);
+  const [selectedConnectionPriority, setSelectedConnectionPriority] =
+    useState<BleConnectionPriorityName>('BALANCED');
+  const [requestedConnectionPriority, setRequestedConnectionPriority] =
+    useState<BleConnectionPriorityName | null>(null);
+  const [connectionPriorityRequestSuccess, setConnectionPriorityRequestSuccess] =
+    useState<boolean | null>(null);
+  const [connectionPriorityRequestError, setConnectionPriorityRequestError] =
+    useState<string | null>(null);
   const [controlState, setControlState] = useState<ControlSyncSnapshot>(() =>
     controlSynchronizerRef.current.snapshot(),
   );
@@ -1025,6 +1063,22 @@ export default function App() {
 
   const enqueueTxFrame = useCallback(
     (kind: TxFrameKind, payload: Uint8Array, highPriority: boolean): void => {
+      const diagnostics = txDiagnosticsRef.current;
+      if (connectedTransportRef.current === 'ble' && !bleTxEnabledRef.current) {
+        diagnostics.txSuppressedTotal += 1;
+        if (kind === 'latency-reply') {
+          diagnostics.latencyRepliesSuppressed += 1;
+        } else {
+          diagnostics.switchFramesSuppressed += 1;
+        }
+        diagnostics.lastTxKind = kind;
+        diagnostics.lastTxHex = frameToHex(payload);
+        diagnostics.lastTxAtMs = monotonicNowMs();
+        diagnostics.lastWriteDurationMs = null;
+        diagnostics.lastQueueDelayMs = null;
+        return;
+      }
+
       const item: TxQueueItem = {
         kind,
         payload: payload.slice(),
@@ -1037,7 +1091,6 @@ export default function App() {
         normalPriorityTxQueueRef.current.push(item);
       }
 
-      const diagnostics = txDiagnosticsRef.current;
       if (kind === 'latency-reply') {
         diagnostics.latencyRepliesQueued += 1;
       } else {
@@ -1086,6 +1139,28 @@ export default function App() {
 
   const incrementControlRotary = useCallback((index: number) => {
     setControlState(controlSynchronizerRef.current.incrementRotary(index));
+  }, []);
+
+  const changeBleTxEnabled = useCallback((enabled: boolean) => {
+    bleTxEnabledRef.current = enabled;
+    setBleTxEnabled(enabled);
+    if (!enabled && connectedTransportRef.current === 'ble') {
+      const pendingItems = [
+        ...highPriorityTxQueueRef.current,
+        ...normalPriorityTxQueueRef.current,
+      ];
+      const diagnostics = txDiagnosticsRef.current;
+      for (const item of pendingItems) {
+        diagnostics.txSuppressedTotal += 1;
+        if (item.kind === 'latency-reply') {
+          diagnostics.latencyRepliesSuppressed += 1;
+        } else {
+          diagnostics.switchFramesSuppressed += 1;
+        }
+      }
+      highPriorityTxQueueRef.current.length = 0;
+      normalPriorityTxQueueRef.current.length = 0;
+    }
   }, []);
 
   const resynchronizeControls = useCallback(() => {
@@ -1270,7 +1345,11 @@ export default function App() {
 
   const connectBleDevice = useCallback(
     async (scannedDevice: Device): Promise<void> => {
+      const priorityName = selectedConnectionPriority;
       setConnectionState('connecting');
+      setRequestedConnectionPriority(null);
+      setConnectionPriorityRequestSuccess(null);
+      setConnectionPriorityRequestError(null);
       setStatusText(
         `Łączenie BLE z ${scannedDevice.localName ?? scannedDevice.name ?? scannedDevice.id}…`,
       );
@@ -1281,16 +1360,21 @@ export default function App() {
       });
       connectedBleDeviceIdRef.current = device.id;
 
+      setRequestedConnectionPriority(priorityName);
       try {
         device = await manager.requestConnectionPriorityForDevice(
           device.id,
-          ConnectionPriority.High,
-          'ecumaster-high-priority',
+          connectionPriorityValue(priorityName),
+          `ecumaster-${priorityName.toLowerCase()}`,
         );
-        setStatusText('Połączono BLE; wysłano żądanie CONNECTION_PRIORITY_HIGH.');
+        setConnectionPriorityRequestSuccess(true);
+        setStatusText(`Połączono BLE; wysłano żądanie CONNECTION_PRIORITY_${priorityName}.`);
       } catch (error) {
+        const description = errorDescription(error);
+        setConnectionPriorityRequestSuccess(false);
+        setConnectionPriorityRequestError(description);
         setStatusText(
-          `Połączono BLE, ale żądanie high priority zwróciło błąd: ${errorDescription(error)}`,
+          `Połączono BLE, ale żądanie CONNECTION_PRIORITY_${priorityName} zwróciło błąd; kontynuuję: ${description}`,
         );
       }
 
@@ -1300,14 +1384,14 @@ export default function App() {
           BLE_CONFIG.requestedMtu,
           'ecumaster-request-mtu',
         );
-        setStatusText(`BLE high priority zażądane; MTU zwrócone przez bibliotekę: ${device.mtu}.`);
+        setStatusText(`BLE priority ${priorityName} zażądane; MTU zwrócone przez bibliotekę: ${device.mtu}.`);
       } catch (error) {
-        setStatusText(`BLE high priority zażądane; MTU request error: ${errorDescription(error)}`);
+        setStatusText(`BLE priority ${priorityName} zażądane; MTU request error: ${errorDescription(error)}`);
       }
 
       await installBleMonitor(device, scannedDevice.rssi ?? null);
     },
-    [installBleMonitor, manager],
+    [installBleMonitor, manager, selectedConnectionPriority],
   );
 
   const startBleScan = useCallback(async () => {
@@ -1834,6 +1918,13 @@ export default function App() {
       `tx_rtt_requests=${txDiagnostics.latencyRequests}`,
       `tx_rtt_queued=${txDiagnostics.latencyRepliesQueued}`,
       `tx_rtt_sent=${txDiagnostics.latencyRepliesSent}`,
+      `ble_tx_enabled=${bleTxEnabled}`,
+      `requested_connection_priority=${requestedConnectionPriority ?? selectedConnectionPriority}`,
+      `connection_priority_request_success=${connectionPriorityRequestSuccess === true}`,
+      `connection_priority_request_error=${connectionPriorityRequestError ?? ''}`,
+      `tx_suppressed_total=${txDiagnostics.txSuppressedTotal}`,
+      `rtt_suppressed=${txDiagnostics.latencyRepliesSuppressed}`,
+      `switch_suppressed=${txDiagnostics.switchFramesSuppressed}`,
       `tx_errors=${txDiagnostics.txErrors}`,
       `tx_queue_depth=${txDiagnostics.queueDepth}`,
       `tx_last_kind=${txDiagnostics.lastTxKind ?? '—'}`,
@@ -1853,11 +1944,16 @@ export default function App() {
 
     await Share.share({ title: 'ECUMaster BT RX Stats', message: report });
   }, [
+    bleTxEnabled,
     classicRxEncoding,
     connectedInfo,
     connectionState,
+    connectionPriorityRequestError,
+    connectionPriorityRequestSuccess,
     controlState,
     liveChannels,
+    requestedConnectionPriority,
+    selectedConnectionPriority,
     stats,
     statusText,
     transportDecodeErrors,
@@ -1970,6 +2066,7 @@ export default function App() {
     !isConnectionBusy && connectionState !== 'scanning' && !hasActiveConnection;
   const canConnectFromList = !connectingRef.current && !hasActiveConnection;
   const canDisconnect = isConnectionBusy || hasActiveConnection;
+  const canChangeConnectionPriority = !isConnectionBusy && !hasActiveConnection;
   const txWritable =
     connectedInfo?.transport === 'spp' ||
     (connectedInfo?.transport === 'ble' && connectedInfo.writeMode !== 'unavailable');
@@ -2128,6 +2225,53 @@ export default function App() {
 
         <View style={styles.card}>
           <Text style={styles.sectionTitle}>Połączenie</Text>
+          {transportMode === 'ble' ? (
+            <View style={styles.diagnosticOptions}>
+              <View style={styles.optionRow}>
+                <Text style={styles.transportText}>BLE TX: {bleTxEnabled ? 'ON' : 'OFF'}</Text>
+                <Switch value={bleTxEnabled} onValueChange={changeBleTxEnabled} />
+              </View>
+              <Text style={styles.transportText}>BLE CONNECTION PRIORITY</Text>
+              <View style={styles.transportRow}>
+                {BLE_CONNECTION_PRIORITIES.map((priority) => (
+                  <Pressable
+                    key={priority.name}
+                    onPress={() => setSelectedConnectionPriority(priority.name)}
+                    disabled={!canChangeConnectionPriority}
+                    style={[
+                      styles.priorityButton,
+                      selectedConnectionPriority === priority.name && styles.transportSelected,
+                      !canChangeConnectionPriority && styles.disabledControl,
+                    ]}
+                  >
+                    <Text
+                      style={[
+                        styles.priorityButtonText,
+                        selectedConnectionPriority === priority.name && styles.transportSelectedText,
+                      ]}
+                    >
+                      {priority.name}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+              <Text style={styles.mono}>wybrany: {selectedConnectionPriority}</Text>
+              <Text style={styles.mono}>
+                zażądany: {requestedConnectionPriority ?? '—'} | wynik:{' '}
+                {connectionPriorityRequestSuccess === null
+                  ? '—'
+                  : connectionPriorityRequestSuccess
+                    ? 'OK'
+                    : 'BŁĄD'}
+              </Text>
+              {connectionPriorityRequestError !== null ? (
+                <Text style={styles.error}>Priority request: {connectionPriorityRequestError}</Text>
+              ) : null}
+              <Text style={styles.note}>
+                Priority można zmienić przed połączeniem BLE. TX OFF blokuje wyłącznie fizyczne zapisy BLE; RX i SPP pozostają aktywne.
+              </Text>
+            </View>
+          ) : null}
           <Text style={styles.status}>{connectionState}</Text>
           <Text style={styles.bodyText}>{statusText}</Text>
           {[
@@ -2432,6 +2576,13 @@ export default function App() {
                 queue depth: {txDiagnostics.queueDepth} | TX errors: {txDiagnostics.txErrors}
               </Text>
               <Text style={styles.mono}>
+                TX suppressed total: {txDiagnostics.txSuppressedTotal}
+              </Text>
+              <Text style={styles.mono}>
+                RTT replies suppressed: {txDiagnostics.latencyRepliesSuppressed} | switch frames suppressed:{' '}
+                {txDiagnostics.switchFramesSuppressed}
+              </Text>
+              <Text style={styles.mono}>
                 last: {txDiagnostics.lastTxKind ?? '—'} | age:{' '}
                 {formatNumber(txDiagnostics.lastTxAgoMs, 1)} ms | write:{' '}
                 {formatNumber(txDiagnostics.lastWriteDurationMs, 2)} ms | queue delay:{' '}
@@ -2518,6 +2669,13 @@ export default function App() {
             {txDiagnostics.latencyRepliesQueued}/{txDiagnostics.latencyRepliesSent}
           </Text>
           <Text style={styles.mono}>
+            TX suppressed total: {txDiagnostics.txSuppressedTotal}
+          </Text>
+          <Text style={styles.mono}>
+            RTT replies suppressed: {txDiagnostics.latencyRepliesSuppressed} | switch frames suppressed:{' '}
+            {txDiagnostics.switchFramesSuppressed}
+          </Text>
+          <Text style={styles.mono}>
             TX errors: {txDiagnostics.txErrors} | last write:{' '}
             {formatNumber(txDiagnostics.lastWriteDurationMs, 2)} ms | queue delay:{' '}
             {formatNumber(txDiagnostics.lastQueueDelayMs, 2)} ms
@@ -2554,7 +2712,16 @@ export default function App() {
               <Text style={styles.mono}>scan filter: NONE</Text>
               <Text style={styles.mono}>scan mode: LowLatency</Text>
               <Text style={styles.mono}>requested MTU: {BLE_CONFIG.requestedMtu}</Text>
-              <Text style={styles.mono}>connection priority: HIGH</Text>
+              <Text style={styles.mono}>
+                connection priority selected/requested: {selectedConnectionPriority}/
+                {requestedConnectionPriority ?? '—'} | success:{' '}
+                {connectionPriorityRequestSuccess === null
+                  ? '—'
+                  : connectionPriorityRequestSuccess
+                    ? 'yes'
+                    : 'no'}
+              </Text>
+              <Text style={styles.mono}>BLE TX: {bleTxEnabled ? 'ON' : 'OFF'}</Text>
               <Text style={styles.mono}>
                 write characteristic: {connectedInfo?.transport === 'ble' ? connectedInfo.writeCharacteristicUuid ?? '—' : '—'}
               </Text>
@@ -2643,6 +2810,15 @@ const styles = StyleSheet.create({
     marginTop: 4,
     gap: 2,
   },
+  diagnosticOptions: {
+    gap: 6,
+    marginBottom: 8,
+  },
+  optionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
   buttonRow: {
     flexDirection: 'row',
     gap: 8,
@@ -2686,6 +2862,21 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
     backgroundColor: '#f3f4f6',
+  },
+  priorityButton: {
+    flex: 1,
+    paddingVertical: 10,
+    paddingHorizontal: 3,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#9ca3af',
+    borderRadius: 8,
+    alignItems: 'center',
+    backgroundColor: '#f3f4f6',
+  },
+  priorityButtonText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#111827',
   },
   transportSelected: {
     backgroundColor: '#2196f3',
