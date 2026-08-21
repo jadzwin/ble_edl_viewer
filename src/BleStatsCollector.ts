@@ -6,6 +6,7 @@ const JS_LAG_SAMPLE_CAPACITY = 2048;
 const RECENT_RATE_WINDOW_MS = 5000;
 const SHORT_RATE_WINDOW_MS = 1000;
 const CHANNEL_TIMESTAMP_CAPACITY = 1024;
+const RECENT_NOTIFICATION_CAPACITY = 2048;
 
 class NumberRing {
   private readonly values: Float64Array;
@@ -77,10 +78,44 @@ class TimestampRing {
   }
 }
 
-interface RecentNotification {
-  timestampMs: number;
-  bytes: number;
-  validFrames: number;
+class RecentNotificationRing {
+  private readonly timestampsMs = new Float64Array(RECENT_NOTIFICATION_CAPACITY);
+  private readonly byteCounts = new Uint32Array(RECENT_NOTIFICATION_CAPACITY);
+  private readonly frameCounts = new Uint32Array(RECENT_NOTIFICATION_CAPACITY);
+  private nextIndex = 0;
+  private count = 0;
+
+  reset(): void {
+    this.nextIndex = 0;
+    this.count = 0;
+  }
+
+  push(timestampMs: number, bytes: number, validFrames: number): void {
+    this.timestampsMs[this.nextIndex] = timestampMs;
+    this.byteCounts[this.nextIndex] = bytes;
+    this.frameCounts[this.nextIndex] = validFrames;
+    this.nextIndex = (this.nextIndex + 1) % RECENT_NOTIFICATION_CAPACITY;
+    this.count = Math.min(this.count + 1, RECENT_NOTIFICATION_CAPACITY);
+  }
+
+  totalsSince(cutoffMs: number): { notifications: number; bytes: number; validFrames: number } {
+    let notifications = 0;
+    let bytes = 0;
+    let validFrames = 0;
+    const startIndex = this.count < RECENT_NOTIFICATION_CAPACITY ? 0 : this.nextIndex;
+
+    for (let index = 0; index < this.count; index += 1) {
+      const sourceIndex = (startIndex + index) % RECENT_NOTIFICATION_CAPACITY;
+      if ((this.timestampsMs[sourceIndex] ?? 0) < cutoffMs) {
+        continue;
+      }
+      notifications += 1;
+      bytes += this.byteCounts[sourceIndex] ?? 0;
+      validFrames += this.frameCounts[sourceIndex] ?? 0;
+    }
+
+    return { notifications, bytes, validFrames };
+  }
 }
 
 export interface DistributionSnapshot {
@@ -102,7 +137,7 @@ export interface ChannelStatsSnapshot {
   lastSeenAgoMs: number | null;
 }
 
-export interface ParsedChannelFrame {
+export interface ControlChannelFrame {
   id: number;
   raw: number;
 }
@@ -122,6 +157,7 @@ export interface BleStatsSnapshot {
   notifications: number;
   notificationsPerSecondAverage: number;
   notificationsPerSecond1s: number;
+  lastNotificationAgoMs: number | null;
   bytes: number;
   bytesPerSecondAverage: number;
   bytesPerSecond1s: number;
@@ -129,6 +165,7 @@ export interface BleStatsSnapshot {
   validFrames: number;
   validFramesPerSecondAverage: number;
   validFramesPerSecond1s: number;
+  lastParserActivityAgoMs: number | null;
   checksumErrors: number;
   markerResyncDrops: number;
   carryBytes: number;
@@ -140,6 +177,7 @@ export interface BleStatsSnapshot {
   notificationGapMs: DistributionSnapshot;
   callbackDurationMs: DistributionSnapshot;
   jsEventLoopLagMs: DistributionSnapshot;
+  maxJsEventLoopLagMs: number;
 
   rpm: ChannelStatsSnapshot;
   iat: ChannelStatsSnapshot;
@@ -188,6 +226,7 @@ function payloadsEqual(a: Uint8Array | null, b: Uint8Array): boolean {
 export class BleStatsCollector {
   private startedAtMs = 0;
   private lastNotificationAtMs: number | null = null;
+  private lastParsedFrameAtMs: number | null = null;
 
   private notifications = 0;
   private bytes = 0;
@@ -196,6 +235,7 @@ export class BleStatsCollector {
   private markerResyncDrops = 0;
   private notificationLengthsNotMultipleOf5 = 0;
   private exactConsecutiveDuplicateNotifications = 0;
+  private maxJsEventLoopLagMs = 0;
 
   private carry = new Uint8Array(0);
   private previousPayload: Uint8Array | null = null;
@@ -210,7 +250,7 @@ export class BleStatsCollector {
   private readonly callbackDurations = new NumberRing(CALLBACK_SAMPLE_CAPACITY);
   private readonly jsEventLoopLags = new NumberRing(JS_LAG_SAMPLE_CAPACITY);
 
-  private recentNotifications: RecentNotification[] = [];
+  private readonly recentNotifications = new RecentNotificationRing();
   private readonly recentChannelTimesMs: TimestampRing[] = Array.from(
     { length: 256 },
     () => new TimestampRing(CHANNEL_TIMESTAMP_CAPACITY),
@@ -219,6 +259,7 @@ export class BleStatsCollector {
   reset(nowMs: number): void {
     this.startedAtMs = nowMs;
     this.lastNotificationAtMs = null;
+    this.lastParsedFrameAtMs = null;
 
     this.notifications = 0;
     this.bytes = 0;
@@ -227,6 +268,7 @@ export class BleStatsCollector {
     this.markerResyncDrops = 0;
     this.notificationLengthsNotMultipleOf5 = 0;
     this.exactConsecutiveDuplicateNotifications = 0;
+    this.maxJsEventLoopLagMs = 0;
 
     this.carry = new Uint8Array(0);
     this.previousPayload = null;
@@ -241,7 +283,7 @@ export class BleStatsCollector {
     this.callbackDurations.reset();
     this.jsEventLoopLags.reset();
 
-    this.recentNotifications = [];
+    this.recentNotifications.reset();
     for (const timestamps of this.recentChannelTimesMs) {
       timestamps.reset();
     }
@@ -260,10 +302,11 @@ export class BleStatsCollector {
   recordJsEventLoopLag(lagMs: number): void {
     if (Number.isFinite(lagMs) && lagMs >= 0) {
       this.jsEventLoopLags.push(lagMs);
+      this.maxJsEventLoopLagMs = Math.max(this.maxJsEventLoopLagMs, lagMs);
     }
   }
 
-  ingestNotification(payload: Uint8Array, nowMs: number): ParsedChannelFrame[] {
+  ingestNotification(payload: Uint8Array, nowMs: number): ControlChannelFrame[] {
     if (this.startedAtMs === 0) {
       this.startedAtMs = nowMs;
     }
@@ -295,7 +338,7 @@ export class BleStatsCollector {
 
     let offset = 0;
     let framesFromThisCallback = 0;
-    const parsedFrames: ParsedChannelFrame[] = [];
+    const controlFrames: ControlChannelFrame[] = [];
 
     while (combined.length - offset >= 5) {
       const id = combined[offset] ?? 0;
@@ -320,40 +363,32 @@ export class BleStatsCollector {
       const raw = (high << 8) | low;
       this.validFrames += 1;
       framesFromThisCallback += 1;
+      this.lastParsedFrameAtMs = nowMs;
       this.channelCounts[id] = (this.channelCounts[id] ?? 0) + 1;
       this.channelLatestRaw[id] = raw;
       this.channelHasRaw[id] = 1;
       this.channelLastSeenMs[id] = nowMs;
 
       this.recentChannelTimesMs[id]?.push(nowMs);
-      parsedFrames.push({ id, raw });
+      // Poza latest-state store dalszej obsługi wymagają wyłącznie kanały
+      // sterowania/RTT. Nie alokujemy obiektu dla każdej ramki telemetrycznej.
+      if (id === 99 || (id >= 252 && id <= 254)) {
+        controlFrames.push({ id, raw });
+      }
 
       offset += 5;
     }
 
     this.carry = combined.slice(offset);
-    this.recentNotifications.push({
-      timestampMs: nowMs,
-      bytes: payload.length,
-      validFrames: framesFromThisCallback,
-    });
-
-    this.pruneRecent(nowMs);
-    return parsedFrames;
+    this.recentNotifications.push(nowMs, payload.length, framesFromThisCallback);
+    return controlFrames;
   }
 
-  private pruneRecent(nowMs: number): void {
-    const notificationCutoff = nowMs - SHORT_RATE_WINDOW_MS;
-    let firstValidNotification = 0;
-    while (
-      firstValidNotification < this.recentNotifications.length &&
-      (this.recentNotifications[firstValidNotification]?.timestampMs ?? nowMs) < notificationCutoff
-    ) {
-      firstValidNotification += 1;
+  latestChannelAgeMs(id: number, nowMs: number): number | null {
+    if (id < 0 || id >= this.channelHasRaw.length || this.channelHasRaw[id] !== 1) {
+      return null;
     }
-    if (firstValidNotification > 0) {
-      this.recentNotifications = this.recentNotifications.slice(firstValidNotification);
-    }
+    return Math.max(0, nowMs - (this.channelLastSeenMs[id] ?? nowMs));
   }
 
   private channelSnapshot(
@@ -426,14 +461,8 @@ export class BleStatsCollector {
   }
 
   snapshot(nowMs: number): BleStatsSnapshot {
-    this.pruneRecent(nowMs);
-
     const elapsedSeconds = Math.max(0.001, (nowMs - this.startedAtMs) / 1000);
-    const bytes1s = this.recentNotifications.reduce((sum, item) => sum + item.bytes, 0);
-    const frames1s = this.recentNotifications.reduce(
-      (sum, item) => sum + item.validFrames,
-      0,
-    );
+    const recent = this.recentNotifications.totalsSince(nowMs - SHORT_RATE_WINDOW_MS);
 
     const rpm = this.channelSnapshot(
       CHANNEL_IDS.rpm,
@@ -467,14 +496,22 @@ export class BleStatsCollector {
 
       notifications: this.notifications,
       notificationsPerSecondAverage: this.notifications / elapsedSeconds,
-      notificationsPerSecond1s: this.recentNotifications.length,
+      notificationsPerSecond1s: recent.notifications,
+      lastNotificationAgoMs:
+        this.lastNotificationAtMs === null
+          ? null
+          : Math.max(0, nowMs - this.lastNotificationAtMs),
       bytes: this.bytes,
       bytesPerSecondAverage: this.bytes / elapsedSeconds,
-      bytesPerSecond1s: bytes1s,
+      bytesPerSecond1s: recent.bytes,
 
       validFrames: this.validFrames,
       validFramesPerSecondAverage: this.validFrames / elapsedSeconds,
-      validFramesPerSecond1s: frames1s,
+      validFramesPerSecond1s: recent.validFrames,
+      lastParserActivityAgoMs:
+        this.lastParsedFrameAtMs === null
+          ? null
+          : Math.max(0, nowMs - this.lastParsedFrameAtMs),
       checksumErrors: this.checksumErrors,
       markerResyncDrops: this.markerResyncDrops,
       carryBytes: this.carry.length,
@@ -488,6 +525,7 @@ export class BleStatsCollector {
       notificationGapMs: distribution(this.notificationGaps.toArray()),
       callbackDurationMs: distribution(this.callbackDurations.toArray()),
       jsEventLoopLagMs: distribution(this.jsEventLoopLags.toArray()),
+      maxJsEventLoopLagMs: this.maxJsEventLoopLagMs,
 
       rpm,
       iat,

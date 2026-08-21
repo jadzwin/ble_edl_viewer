@@ -33,7 +33,7 @@ import type {
   BleStatsSnapshot,
   ChannelLiveSnapshot,
   ChannelStatsSnapshot,
-  ParsedChannelFrame,
+  ControlChannelFrame,
   DistributionSnapshot,
 } from './src/BleStatsCollector';
 import { BLE_CONFIG } from './src/config';
@@ -46,6 +46,8 @@ import {
   frameToHex,
 } from './src/controlProtocol';
 import type { ControlSyncSnapshot } from './src/controlProtocol';
+import { UiRefreshDiagnostics } from './src/UiRefreshDiagnostics';
+import type { UiRefreshDiagnosticsSnapshot } from './src/UiRefreshDiagnostics';
 
 type TransportMode = 'ble' | 'spp';
 type MainView = 'connection' | 'channels' | 'controls' | 'statistics';
@@ -254,6 +256,10 @@ function connectionPriorityValue(name: BleConnectionPriorityName): ConnectionPri
     ?? ConnectionPriority.Balanced;
 }
 
+function rpmSnapshotCount(channels: readonly ChannelLiveSnapshot[]): number {
+  return channels.find((channel) => channel.id === 1)?.count ?? 0;
+}
+
 function emptyTxDiagnosticsMutable(): TxDiagnosticsMutable {
   return {
     switchPolls: 0,
@@ -331,17 +337,6 @@ function bleDeviceToRow(device: Device): BleScanDeviceRow {
     isConnectable: device.isConnectable ?? null,
     serviceUUIDs: device.serviceUUIDs ?? null,
   };
-}
-
-function sortBleDevices(rows: BleScanDeviceRow[]): BleScanDeviceRow[] {
-  return rows.sort((a, b) => {
-    const aRssi = a.rssi ?? -999;
-    const bRssi = b.rssi ?? -999;
-    if (aRssi !== bRssi) {
-      return bRssi - aRssi;
-    }
-    return bleDeviceDisplayName(a).localeCompare(bleDeviceDisplayName(b));
-  });
 }
 
 function finiteNumber(value: unknown): number | null {
@@ -552,12 +547,14 @@ function emptySnapshot(): BleStatsSnapshot {
     notifications: 0,
     notificationsPerSecondAverage: 0,
     notificationsPerSecond1s: 0,
+    lastNotificationAgoMs: null,
     bytes: 0,
     bytesPerSecondAverage: 0,
     bytesPerSecond1s: 0,
     validFrames: 0,
     validFramesPerSecondAverage: 0,
     validFramesPerSecond1s: 0,
+    lastParserActivityAgoMs: null,
     checksumErrors: 0,
     markerResyncDrops: 0,
     carryBytes: 0,
@@ -568,6 +565,7 @@ function emptySnapshot(): BleStatsSnapshot {
     notificationGapMs: emptyDistribution,
     callbackDurationMs: emptyDistribution,
     jsEventLoopLagMs: emptyDistribution,
+    maxJsEventLoopLagMs: 0,
     rpm: channel(1, BLE_CONFIG.expectedRatesHz.rpm),
     iat: channel(4, BLE_CONFIG.expectedRatesHz.iat),
     clt: channel(24, BLE_CONFIG.expectedRatesHz.clt),
@@ -751,6 +749,9 @@ export default function App() {
 
   const manager = useMemo(() => new BleManager(), []);
   const collectorRef = useRef(new BleStatsCollector());
+  const uiRefreshDiagnosticsRef = useRef(
+    new UiRefreshDiagnostics(BLE_CONFIG.channelUiRefreshMs),
+  );
   const { width: windowWidth } = useWindowDimensions();
   const compactChannelGrid = windowWidth < 700;
 
@@ -778,6 +779,8 @@ export default function App() {
   const transportDecodeErrorsRef = useRef(0);
   const classicRxEncodingRef = useRef<ClassicRxEncoding>('unknown');
   const mainViewRef = useRef<MainView>('connection');
+  const channelUiCommitPendingRef = useRef(false);
+  const scheduleChannelUiRefreshRef = useRef<(() => void) | null>(null);
 
   const controlSynchronizerRef = useRef(new ControlStateSynchronizer());
   const bleTxTargetRef = useRef<BleTxTarget | null>(null);
@@ -787,6 +790,7 @@ export default function App() {
   const txGenerationRef = useRef(0);
   const txDiagnosticsRef = useRef<TxDiagnosticsMutable>(emptyTxDiagnosticsMutable());
   const bleTxEnabledRef = useRef(true);
+  const controlStateDirtyRef = useRef(false);
 
   const [transportMode, setTransportMode] = useState<TransportMode>('ble');
   const [mainView, setMainView] = useState<MainView>('connection');
@@ -809,6 +813,10 @@ export default function App() {
     max: number | null;
   }>({ min: null, max: null });
   const [liveChannels, setLiveChannels] = useState<ChannelLiveSnapshot[]>([]);
+  const [uiRefreshDiagnostics, setUiRefreshDiagnostics] =
+    useState<UiRefreshDiagnosticsSnapshot>(() =>
+      uiRefreshDiagnosticsRef.current.snapshot(monotonicNowMs()),
+    );
   const [transportDecodeErrors, setTransportDecodeErrors] = useState(0);
   const [classicRxEncoding, setClassicRxEncoding] = useState<ClassicRxEncoding>('unknown');
   const [bleTxEnabled, setBleTxEnabled] = useState(true);
@@ -833,7 +841,9 @@ export default function App() {
   }, []);
 
   const refreshBleScanList = useCallback(() => {
-    setBleScanDevices(sortBleDevices(Array.from(discoveredBleRowsRef.current.values())));
+    // Map zachowuje kolejność pierwszego wykrycia. Ponowne set() dla tego samego
+    // urządzenia aktualizuje RSSI/metadane bez przesuwania pozycji na liście.
+    setBleScanDevices(Array.from(discoveredBleRowsRef.current.values()));
   }, []);
 
   const refreshSppScanList = useCallback(() => {
@@ -931,7 +941,9 @@ export default function App() {
   }, []);
 
   const resetStats = useCallback(() => {
-    collectorRef.current.reset(monotonicNowMs());
+    const nowMs = monotonicNowMs();
+    collectorRef.current.reset(nowMs);
+    uiRefreshDiagnosticsRef.current.reset();
     lastChartFrameCountRef.current = 0;
     frameRateRangeSamplingReadyRef.current = false;
     transportDecodeErrorsRef.current = 0;
@@ -942,6 +954,7 @@ export default function App() {
     setFrameRateHistory(Array(FRAME_RATE_CHART_SECONDS).fill(0));
     setFrameRateRange({ min: null, max: null });
     setLiveChannels([]);
+    setUiRefreshDiagnostics(uiRefreshDiagnosticsRef.current.snapshot(nowMs));
   }, []);
 
   const resetControlSession = useCallback(() => {
@@ -950,6 +963,7 @@ export default function App() {
     normalPriorityTxQueueRef.current.length = 0;
     bleTxTargetRef.current = null;
     const controlSnapshot = controlSynchronizerRef.current.reset();
+    controlStateDirtyRef.current = false;
     const emptyTx = emptyTxDiagnosticsMutable();
     txDiagnosticsRef.current = emptyTx;
     setControlState(controlSnapshot);
@@ -1102,7 +1116,7 @@ export default function App() {
   );
 
   const handleParsedFrames = useCallback(
-    (frames: readonly ParsedChannelFrame[]): void => {
+    (frames: readonly ControlChannelFrame[]): void => {
       // RTT ma najwyższy priorytet. Najpierw przeglądamy cały odebrany fragment
       // pod kątem ID 99, a dopiero później kolejkujemy ramki statusu switchy.
       for (const frame of frames) {
@@ -1127,7 +1141,9 @@ export default function App() {
       }
 
       if (stateChanged) {
-        setControlState(controlSynchronizerRef.current.snapshot());
+        // Stan protokołu zmienia się natychmiast, ale jego kopia React może
+        // poczekać na wolniejszy tick statusów poza callbackiem RX.
+        controlStateDirtyRef.current = true;
       }
     },
     [enqueueTxFrame],
@@ -1869,7 +1885,7 @@ export default function App() {
       });
 
     const report = [
-      'ECUMaster BT RX Stats v1.6',
+      'ECUMaster BT RX Stats v1.7',
       `generated=${new Date().toISOString()}`,
       `state=${connectionState}`,
       `status=${statusText}`,
@@ -1905,6 +1921,22 @@ export default function App() {
       `chunk_gap_ms=${JSON.stringify(stats.notificationGapMs)}`,
       `callback_duration_ms=${JSON.stringify(stats.callbackDurationMs)}`,
       `js_event_loop_lag_ms=${JSON.stringify(stats.jsEventLoopLagMs)}`,
+      `js_event_loop_lag_max_ms=${stats.maxJsEventLoopLagMs}`,
+      `last_rx_callback_age_ms=${stats.lastNotificationAgoMs ?? '—'}`,
+      `last_parser_activity_age_ms=${stats.lastParserActivityAgoMs ?? '—'}`,
+      `ui_refresh_requested=${uiRefreshDiagnostics.requested}`,
+      `ui_refresh_executed=${uiRefreshDiagnostics.executed}`,
+      `ui_refresh_committed=${uiRefreshDiagnostics.committed}`,
+      `ui_refresh_coalesced=${uiRefreshDiagnostics.coalesced}`,
+      `ui_refresh_interval_ms=${JSON.stringify(uiRefreshDiagnostics.actualIntervalMs)}`,
+      `ui_refresh_lateness_ms=${JSON.stringify(uiRefreshDiagnostics.latenessMs)}`,
+      `ui_snapshot_preparation_ms=${JSON.stringify(uiRefreshDiagnostics.preparationDurationMs)}`,
+      `ui_snapshot_commit_delay_ms=${JSON.stringify(uiRefreshDiagnostics.commitDelayMs)}`,
+      `ui_rpm_latest_age_ms=${uiRefreshDiagnostics.rpmLatestAgeMs ?? '—'}`,
+      `ui_rpm_snapshot_behind_frames=${Math.max(
+        0,
+        stats.rpm.count - uiRefreshDiagnostics.rpmSnapshotCount,
+      )}`,
       `controls_initialized=${controlState.initialized}`,
       `controls_seen_254=${controlState.seenSwitches}`,
       `controls_seen_253=${controlState.seenRotary1234}`,
@@ -1959,16 +1991,25 @@ export default function App() {
     transportDecodeErrors,
     transportMode,
     txDiagnostics,
+    uiRefreshDiagnostics,
   ]);
 
   useEffect(() => {
     void manager.setLogLevel(LogLevel.None).catch(() => undefined);
 
-    const uiTimer = setInterval(() => {
+    let disposed = false;
+    let statsTimer: ReturnType<typeof setTimeout> | null = null;
+    let channelUiTimer: ReturnType<typeof setTimeout> | null = null;
+    let frameRateChartTimer: ReturnType<typeof setTimeout> | null = null;
+    let lagTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const refreshStats = () => {
+      if (disposed) return;
       const nowMs = monotonicNowMs();
       setStats(collectorRef.current.snapshot(nowMs));
       setTransportDecodeErrors(transportDecodeErrorsRef.current);
       setClassicRxEncoding(classicRxEncodingRef.current);
+      setUiRefreshDiagnostics(uiRefreshDiagnosticsRef.current.snapshot(nowMs));
       setTxDiagnostics(
         txDiagnosticsSnapshot(
           txDiagnosticsRef.current,
@@ -1976,18 +2017,52 @@ export default function App() {
           highPriorityTxQueueRef.current.length + normalPriorityTxQueueRef.current.length,
         ),
       );
-    }, BLE_CONFIG.uiRefreshMs);
-
-    const channelUiTimer = setInterval(() => {
-      if (
-        mainViewRef.current === 'channels' &&
-        connectedTransportRef.current !== null
-      ) {
-        setLiveChannels(collectorRef.current.liveChannelsSnapshot(monotonicNowMs()));
+      if (controlStateDirtyRef.current) {
+        controlStateDirtyRef.current = false;
+        setControlState(controlSynchronizerRef.current.snapshot());
       }
-    }, BLE_CONFIG.channelUiRefreshMs);
+      statsTimer = setTimeout(refreshStats, BLE_CONFIG.uiRefreshMs);
+    };
+    statsTimer = setTimeout(refreshStats, BLE_CONFIG.uiRefreshMs);
 
-    const frameRateChartTimer = setInterval(() => {
+    let nextChannelRefreshAtMs = monotonicNowMs() + BLE_CONFIG.channelUiRefreshMs;
+    const scheduleChannelRefresh = () => {
+      if (disposed || channelUiTimer !== null || channelUiCommitPendingRef.current) return;
+      const delayMs = Math.max(0, nextChannelRefreshAtMs - monotonicNowMs());
+      channelUiTimer = setTimeout(() => {
+        channelUiTimer = null;
+        if (disposed) return;
+
+        const startedAtMs = monotonicNowMs();
+        if (
+          mainViewRef.current !== 'channels' ||
+          connectedTransportRef.current === null
+        ) {
+          uiRefreshDiagnosticsRef.current.markInactive();
+          nextChannelRefreshAtMs = startedAtMs + BLE_CONFIG.channelUiRefreshMs;
+          scheduleChannelRefresh();
+          return;
+        }
+
+        const channels = collectorRef.current.liveChannelsSnapshot(startedAtMs);
+        const preparationDurationMs = monotonicNowMs() - startedAtMs;
+        uiRefreshDiagnosticsRef.current.recordExecution(
+          startedAtMs,
+          preparationDurationMs,
+          collectorRef.current.latestChannelAgeMs(1, startedAtMs),
+          rpmSnapshotCount(channels),
+        );
+        channelUiCommitPendingRef.current = true;
+        nextChannelRefreshAtMs = startedAtMs + BLE_CONFIG.channelUiRefreshMs;
+        setLiveChannels(channels);
+        // Następny timeout ustawia useEffect po commitcie tej kopii React.
+      }, delayMs);
+    };
+    scheduleChannelUiRefreshRef.current = scheduleChannelRefresh;
+    scheduleChannelRefresh();
+
+    const refreshFrameRateChart = () => {
+      if (disposed) return;
       const currentFrameCount = collectorRef.current.getValidFrameCount();
       const framesSinceLastSample = Math.max(
         0,
@@ -2014,11 +2089,14 @@ export default function App() {
         ...previous.slice(-(FRAME_RATE_CHART_SECONDS - 1)),
         framesSinceLastSample,
       ]);
-    }, 1000);
+      frameRateChartTimer = setTimeout(refreshFrameRateChart, 1000);
+    };
+    frameRateChartTimer = setTimeout(refreshFrameRateChart, 1000);
 
     const lagIntervalMs = 100;
     let nextExpected = monotonicNowMs() + lagIntervalMs;
-    const lagTimer = setInterval(() => {
+    const sampleEventLoopLag = () => {
+      if (disposed) return;
       const now = monotonicNowMs();
       const lag = Math.max(0, now - nextExpected);
       collectorRef.current.recordJsEventLoopLag(lag);
@@ -2026,14 +2104,19 @@ export default function App() {
       if (now - nextExpected > lagIntervalMs * 5) {
         nextExpected = now + lagIntervalMs;
       }
-    }, lagIntervalMs);
+      lagTimer = setTimeout(sampleEventLoopLag, Math.max(0, nextExpected - monotonicNowMs()));
+    };
+    lagTimer = setTimeout(sampleEventLoopLag, lagIntervalMs);
 
     return () => {
+      disposed = true;
       intentionalDisconnectRef.current = true;
-      clearInterval(uiTimer);
-      clearInterval(channelUiTimer);
-      clearInterval(frameRateChartTimer);
-      clearInterval(lagTimer);
+      if (statsTimer !== null) clearTimeout(statsTimer);
+      if (channelUiTimer !== null) clearTimeout(channelUiTimer);
+      if (frameRateChartTimer !== null) clearTimeout(frameRateChartTimer);
+      if (lagTimer !== null) clearTimeout(lagTimer);
+      channelUiCommitPendingRef.current = false;
+      scheduleChannelUiRefreshRef.current = null;
       stopBleScan();
       void cancelSppDiscovery(true);
       removeSubscriptions();
@@ -2048,6 +2131,13 @@ export default function App() {
       void manager.destroy().catch(() => undefined);
     };
   }, [cancelSppDiscovery, manager, removeSubscriptions, stopBleScan]);
+
+  useEffect(() => {
+    if (!channelUiCommitPendingRef.current) return;
+    channelUiCommitPendingRef.current = false;
+    uiRefreshDiagnosticsRef.current.recordCommit(monotonicNowMs());
+    scheduleChannelUiRefreshRef.current?.();
+  }, [liveChannels]);
 
   const isConnectionBusy = [
     'waiting-for-bluetooth',
@@ -2138,7 +2228,7 @@ export default function App() {
     <SafeAreaView style={styles.safeArea}>
       <StatusBar barStyle="dark-content" backgroundColor="#f2f3f5" />
       <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.title}>ECUMaster BT RX Stats v1.6</Text>
+        <Text style={styles.title}>ECUMaster BT RX Stats v1.7</Text>
         <Text style={styles.subtitle}>
           Miernik RX/TX dla BLE/GATT i SPP/RFCOMM. Oprócz kanałów i statystyk obsługuje 8 przełączników, 8 wartości rotary 0–15 oraz natychmiastową odpowiedź RTT po odebraniu kanału 99.
         </Text>
@@ -2441,6 +2531,10 @@ export default function App() {
               <Text style={styles.mono}>
                 aktywne ID: {liveChannels.length} | opisane w TypeScript: {READABLE_CHANNEL_LIST.length} | transport: {transportMode.toUpperCase()}
               </Text>
+              <Text style={styles.mono}>
+                RPM latest age: {formatNumber(uiRefreshDiagnostics.rpmLatestAgeMs, 0)} ms | UI
+                coalesced: {uiRefreshDiagnostics.coalesced}
+              </Text>
               <View style={styles.buttonRow}>
                 <View style={styles.buttonCell}>
                   <Button title="Rozłącz" onPress={() => void disconnect()} disabled={!canDisconnect} />
@@ -2699,8 +2793,57 @@ export default function App() {
           <Text style={styles.mono}>
             JS event-loop lag [ms]: {formatDistribution(stats.jsEventLoopLagMs)}
           </Text>
+          <Text style={styles.mono}>
+            maksymalny JS event-loop lag od resetu: {formatNumber(stats.maxJsEventLoopLagMs, 1)} ms
+          </Text>
           <Text style={styles.note}>
-            Widok statystyk odświeża się 2 razy/s, a lekki widok kanałów 25 razy/s. Callback odbiorczy dekoduje dane, aktualizuje liczniki i kolejkuje krótkie ramki TX; zapis do BLE/SPP jest serializowany poza parserem. Nie ma logowania ani zapisu pliku per ramka.
+            Widok statystyk odświeża się 2 razy/s, a widok kanałów maksymalnie 25 razy/s.
+            Callback odbiorczy dekoduje dane, aktualizuje latest-state i kolejkuje krótkie ramki
+            TX; zapis do BLE/SPP jest serializowany poza parserem.
+          </Text>
+        </View>
+
+        <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Diagnostyka backlogu RX / UI</Text>
+          <Text style={styles.mono}>
+            RX callbacks total: {stats.notifications} | callbacks/s: {stats.notificationsPerSecond1s}
+          </Text>
+          <Text style={styles.mono}>
+            parsed frames/s: {stats.validFramesPerSecond1s} | last RX callback age:{' '}
+            {formatNumber(stats.lastNotificationAgoMs, 0)} ms | last parser activity age:{' '}
+            {formatNumber(stats.lastParserActivityAgoMs, 0)} ms
+          </Text>
+          <Text style={styles.mono}>
+            UI refresh requested/executed/committed: {uiRefreshDiagnostics.requested}/
+            {uiRefreshDiagnostics.executed}/{uiRefreshDiagnostics.committed} | coalesced:{' '}
+            {uiRefreshDiagnostics.coalesced}
+          </Text>
+          <Text style={styles.mono}>
+            UI actual interval [ms]: {formatDistribution(uiRefreshDiagnostics.actualIntervalMs)}
+          </Text>
+          <Text style={styles.mono}>
+            UI lateness vs {BLE_CONFIG.channelUiRefreshMs} ms:{' '}
+            {formatDistribution(uiRefreshDiagnostics.latenessMs)}
+          </Text>
+          <Text style={styles.mono}>
+            snapshot preparation [ms]:{' '}
+            {formatDistribution(uiRefreshDiagnostics.preparationDurationMs)}
+          </Text>
+          <Text style={styles.mono}>
+            React commit delay [ms]: {formatDistribution(uiRefreshDiagnostics.commitDelayMs)}
+          </Text>
+          <Text style={styles.mono}>
+            RPM latest age: {formatNumber(uiRefreshDiagnostics.rpmLatestAgeMs, 0)} ms | UI
+            snapshot behind store: {Math.max(
+              0,
+              stats.rpm.count - uiRefreshDiagnostics.rpmSnapshotCount,
+            )}{' '}
+            ramek
+          </Text>
+          <Text style={styles.note}>
+            Liczniki requested/coalesced odnoszą się do nominalnych slotów 40 ms. Następny
+            snapshot jest planowany dopiero po commitcie poprzedniego, więc aplikacja nie odtwarza
+            opuszczonych stanów po kolei.
           </Text>
         </View>
 
