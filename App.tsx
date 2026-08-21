@@ -35,6 +35,7 @@ import type {
   ChannelStatsSnapshot,
   ControlChannelFrame,
   DistributionSnapshot,
+  RoundTripRangeSample,
 } from './src/BleStatsCollector';
 import { BLE_CONFIG } from './src/config';
 import { READABLE_CHANNEL_LIST, READABLE_CHANNELS, formatChannelValue } from './src/channels';
@@ -58,6 +59,8 @@ type BleConnectionPriorityName = 'LOW_POWER' | 'BALANCED' | 'HIGH';
 const FRAME_RATE_CHART_SECONDS = 60;
 const FRAME_RATE_CHART_MAX = 1000;
 const FRAME_RATE_CHART_HEIGHT = 180;
+const ROUND_TRIP_CHART_MIN_MS = 40;
+const ROUND_TRIP_CHART_MAX_MS = 200;
 
 type ConnectionState =
   | 'idle'
@@ -695,6 +698,84 @@ function FrameRateChart({ samples }: { samples: readonly number[] }) {
   );
 }
 
+function RoundTripRangeChart({ samples }: { samples: readonly RoundTripRangeSample[] }) {
+  const latest = samples[samples.length - 1];
+  const latestText =
+    latest === undefined || latest.minMs === null || latest.maxMs === null
+      ? '—'
+      : `${formatNumber(latest.minMs, 1)}–${formatNumber(latest.maxMs, 1)} ms`;
+  const valueToTop = (valueMs: number): number => {
+    const clamped = Math.min(
+      ROUND_TRIP_CHART_MAX_MS,
+      Math.max(ROUND_TRIP_CHART_MIN_MS, valueMs),
+    );
+    return (
+      ((ROUND_TRIP_CHART_MAX_MS - clamped) /
+        (ROUND_TRIP_CHART_MAX_MS - ROUND_TRIP_CHART_MIN_MS)) *
+      FRAME_RATE_CHART_HEIGHT
+    );
+  };
+
+  return (
+    <View>
+      <View style={styles.chartHeaderRow}>
+        <Text style={styles.mono}>Round-trip min / max w każdej sekundzie</Text>
+        <Text style={styles.mono}>teraz: {latestText}</Text>
+      </View>
+      <View style={styles.chartBody}>
+        <View style={styles.chartYAxis}>
+          {[200, 160, 120, 80, 40].map((value) => (
+            <Text key={value} style={styles.chartAxisLabel}>
+              {value}
+            </Text>
+          ))}
+        </View>
+        <View style={styles.chartPlot}>
+          {[0, 0.25, 0.5, 0.75, 1].map((position) => (
+            <View
+              key={position}
+              style={[styles.chartGridLine, { top: position * FRAME_RATE_CHART_HEIGHT }]}
+            />
+          ))}
+          <View style={styles.chartBars}>
+            {samples.map((sample, index) => {
+              if (sample.minMs === null || sample.maxMs === null) {
+                return <View key={index} style={styles.chartBarCell} />;
+              }
+              const rangeTop = valueToTop(sample.maxMs);
+              const rangeBottom = valueToTop(sample.minMs);
+              const height = Math.max(2, rangeBottom - rangeTop);
+              const top = Math.min(FRAME_RATE_CHART_HEIGHT - height, rangeTop);
+              return (
+                <View key={index} style={styles.chartBarCell}>
+                  <View
+                    style={[
+                      styles.roundTripRangeBar,
+                      sample.maxMs > ROUND_TRIP_CHART_MAX_MS && styles.chartBarOverflow,
+                      { top, height },
+                    ]}
+                  />
+                </View>
+              );
+            })}
+          </View>
+        </View>
+      </View>
+      <View style={styles.chartXAxisRow}>
+        <Text style={styles.chartAxisLabel}>-60</Text>
+        <Text style={styles.chartAxisLabel}>-45</Text>
+        <Text style={styles.chartAxisLabel}>-30</Text>
+        <Text style={styles.chartAxisLabel}>-15</Text>
+        <Text style={styles.chartAxisLabel}>0 s</Text>
+      </View>
+      <Text style={styles.note}>
+        Każdy słupek obejmuje minimum–maksimum RTT z jednej sekundy. Skala ma 40–200 ms;
+        przekroczenie 200 ms jest zaznaczone na czerwono.
+      </Text>
+    </View>
+  );
+}
+
 const ChannelTile = React.memo(
   function ChannelTileView({
     model,
@@ -805,6 +886,15 @@ export default function App() {
   const [stats, setStats] = useState<BleStatsSnapshot>(() => emptySnapshot());
   const [frameRateHistory, setFrameRateHistory] = useState<number[]>(() =>
     Array(FRAME_RATE_CHART_SECONDS).fill(0),
+  );
+  const [roundTripRangeHistory, setRoundTripRangeHistory] = useState<
+    RoundTripRangeSample[]
+  >(() =>
+    Array.from({ length: FRAME_RATE_CHART_SECONDS }, () => ({
+      minMs: null,
+      maxMs: null,
+      count: 0,
+    })),
   );
   const lastChartFrameCountRef = useRef(0);
   const frameRateRangeSamplingReadyRef = useRef(false);
@@ -952,6 +1042,13 @@ export default function App() {
     setClassicRxEncoding('unknown');
     setStats(emptySnapshot());
     setFrameRateHistory(Array(FRAME_RATE_CHART_SECONDS).fill(0));
+    setRoundTripRangeHistory(
+      Array.from({ length: FRAME_RATE_CHART_SECONDS }, () => ({
+        minMs: null,
+        maxMs: null,
+        count: 0,
+      })),
+    );
     setFrameRateRange({ min: null, max: null });
     setLiveChannels([]);
     setUiRefreshDiagnostics(uiRefreshDiagnosticsRef.current.snapshot(nowMs));
@@ -2089,6 +2186,11 @@ export default function App() {
         ...previous.slice(-(FRAME_RATE_CHART_SECONDS - 1)),
         framesSinceLastSample,
       ]);
+      const roundTripSample = collectorRef.current.consumeRoundTripRangeSample();
+      setRoundTripRangeHistory((previous) => [
+        ...previous.slice(-(FRAME_RATE_CHART_SECONDS - 1)),
+        roundTripSample,
+      ]);
       frameRateChartTimer = setTimeout(refreshFrameRateChart, 1000);
     };
     frameRateChartTimer = setTimeout(refreshFrameRateChart, 1000);
@@ -2702,6 +2804,11 @@ export default function App() {
         </View>
 
         <View style={styles.card}>
+          <Text style={styles.sectionTitle}>Round-trip na sekundę</Text>
+          <RoundTripRangeChart samples={roundTripRangeHistory} />
+        </View>
+
+        <View style={styles.card}>
           <Text style={styles.sectionTitle}>Transport</Text>
           <Text style={styles.mono}>czas: {formatNumber(stats.elapsedSeconds, 1)} s</Text>
           <Text style={styles.mono}>
@@ -3089,6 +3196,12 @@ const styles = StyleSheet.create({
   },
   chartBarOverflow: {
     backgroundColor: '#dc2626',
+  },
+  roundTripRangeBar: {
+    position: 'absolute',
+    width: '65%',
+    minHeight: 2,
+    backgroundColor: '#0f766e',
   },
   chartXAxisRow: {
     marginLeft: 34,

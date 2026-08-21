@@ -1,4 +1,5 @@
 import { BLE_CONFIG, CHANNEL_IDS } from './config';
+import { READABLE_CHANNELS, decodeChannelRaw } from './channels';
 
 const GAP_SAMPLE_CAPACITY = 4096;
 const CALLBACK_SAMPLE_CAPACITY = 2048;
@@ -142,6 +143,12 @@ export interface ControlChannelFrame {
   raw: number;
 }
 
+export interface RoundTripRangeSample {
+  minMs: number | null;
+  maxMs: number | null;
+  count: number;
+}
+
 export interface ChannelLiveSnapshot {
   id: number;
   count: number;
@@ -236,6 +243,9 @@ export class BleStatsCollector {
   private notificationLengthsNotMultipleOf5 = 0;
   private exactConsecutiveDuplicateNotifications = 0;
   private maxJsEventLoopLagMs = 0;
+  private roundTripMinMs: number | null = null;
+  private roundTripMaxMs: number | null = null;
+  private roundTripSampleCount = 0;
 
   private carry = new Uint8Array(0);
   private previousPayload: Uint8Array | null = null;
@@ -269,6 +279,9 @@ export class BleStatsCollector {
     this.notificationLengthsNotMultipleOf5 = 0;
     this.exactConsecutiveDuplicateNotifications = 0;
     this.maxJsEventLoopLagMs = 0;
+    this.roundTripMinMs = null;
+    this.roundTripMaxMs = null;
+    this.roundTripSampleCount = 0;
 
     this.carry = new Uint8Array(0);
     this.previousPayload = null;
@@ -370,6 +383,18 @@ export class BleStatsCollector {
       this.channelLastSeenMs[id] = nowMs;
 
       this.recentChannelTimesMs[id]?.push(nowMs);
+      if (id === 99) {
+        const roundTripMs = decodeChannelRaw(READABLE_CHANNELS[99]!, raw);
+        this.roundTripMinMs =
+          this.roundTripMinMs === null
+            ? roundTripMs
+            : Math.min(this.roundTripMinMs, roundTripMs);
+        this.roundTripMaxMs =
+          this.roundTripMaxMs === null
+            ? roundTripMs
+            : Math.max(this.roundTripMaxMs, roundTripMs);
+        this.roundTripSampleCount += 1;
+      }
       // Poza latest-state store dalszej obsługi wymagają wyłącznie kanały
       // sterowania/RTT. Nie alokujemy obiektu dla każdej ramki telemetrycznej.
       if (id === 99 || (id >= 252 && id <= 254)) {
@@ -382,6 +407,18 @@ export class BleStatsCollector {
     this.carry = combined.slice(offset);
     this.recentNotifications.push(nowMs, payload.length, framesFromThisCallback);
     return controlFrames;
+  }
+
+  consumeRoundTripRangeSample(): RoundTripRangeSample {
+    const sample = {
+      minMs: this.roundTripMinMs,
+      maxMs: this.roundTripMaxMs,
+      count: this.roundTripSampleCount,
+    };
+    this.roundTripMinMs = null;
+    this.roundTripMaxMs = null;
+    this.roundTripSampleCount = 0;
+    return sample;
   }
 
   latestChannelAgeMs(id: number, nowMs: number): number | null {
